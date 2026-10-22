@@ -1,0 +1,70 @@
+[package]
+name = "datamind"
+version = "1.0.0"
+description = "DataMind — 与数据对话的桌面客户端"
+authors = ["DataMind Contributors"]
+license = "MIT"
+repository = "https://github.com/your-github-name/DataMind"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "datamind_lib"
+crate-type = ["staticlib", "rlib", "cdylib"]
+
+# 发行构建必须启用 custom-protocol：启用后前端资源随 exe 内嵌（tauri:// 协议），
+# 否则会去加载 build.devUrl（http://localhost:5173）导致"无法访问此页面"。
+# tauri CLI 的 `tauri build` 会自动加上，直接用 cargo 构建时需显式 --features custom-protocol
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+
+# MySQL（纯 Rust 驱动 + rustls，避免 OpenSSL 依赖）
+mysql_async = { version = "0.34", default-features = false, features = ["minimal", "rustls-tls"] }
+
+# SSH 隧道（纯 Rust）
+russh = "0.45"
+russh-keys = "0.45"
+async-trait = "0.1"
+
+# SQL 解析（只读保护：仅放行 SELECT）
+sqlparser = "0.55"
+
+# 字符集兜底解码：服务端返回非 UTF-8 字节（GBK / BIG5 / latin1 历史数据）时还原中文
+encoding_rs = "0.8"
+
+# LLM HTTP 调用（OpenAI 兼容协议）
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Windows 进程/注册表探测（界面渲染守护与输入法冲突检测）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

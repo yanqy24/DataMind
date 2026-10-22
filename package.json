@@ -1,0 +1,30 @@
+{
+  "name": "datamind",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DataMind — 自然语言查询数据库的桌面客户端 (Tauri 2 + Vue 3 + Rust)",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "build:exe": "npm run build && cd src-tauri && cargo build --release --features custom-protocol"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.2.0",
+    "@tauri-apps/plugin-clipboard-manager": "^2.2.0",
+    "sql-formatter": "^15.4.0",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.0",
+    "@vitejs/plugin-vue": "^5.2.0",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.0",
+    "vue-tsc": "^2.2.0"
+  }
+}

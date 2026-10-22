@@ -1,0 +1,151 @@
+/* ============================================================
+ * base.css — 设计令牌 / 重置 / 排版
+ * Modern Minimalist（参考 Linear / Termius / Notion）
+ * 中性色 + 1px 发丝边框 + 克制阴影 + 紧凑行高 + 等宽数字
+ * ============================================================ */
+
+:root{
+  --font: "Inter", "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: "JetBrains Mono", "Geist Mono", "Cascadia Code", "Consolas", "Menlo", monospace;
+
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r: 8px;
+  --r-lg: 10px;
+
+  --speed: .14s;
+  --ease: cubic-bezier(.4, 0, .2, 1);
+
+  --appbar-h: 44px;
+  --row-h: 30px;
+}
+
+/* ---------- 深色（默认） ---------- */
+[data-theme="dark"]{
+  --bg: #0E0F11;
+  --surface: #16181B;
+  --surface-2: #1B1E22;
+  --surface-3: #22262B;
+  --surface-4: #2A2F35;
+
+  --border: #24282E;
+  --border-strong: #343941;
+
+  --text: #ECEEF1;
+  --text-2: #9BA1AA;
+  --text-3: #6B717A;
+
+  --accent: #7B86DB;
+  --accent-hover: #8E97E4;
+  --accent-soft: rgba(123,134,219,.14);
+  --accent-line: rgba(123,134,219,.5);
+
+  --ok: #4CC38A;
+  --ok-soft: rgba(76,195,138,.13);
+  --warn: #E2B341;
+  --warn-soft: rgba(226,179,65,.13);
+  --err: #F0655F;
+  --err-soft: rgba(240,101,95,.13);
+
+  --sel: rgba(123,134,219,.22);
+  --shadow-1: 0 1px 2px rgba(0,0,0,.35);
+  --shadow-2: 0 16px 40px rgba(0,0,0,.5), 0 2px 8px rgba(0,0,0,.3);
+  --grid-line: #20242A;
+  --code-bg: #121417;
+  --sidebar-bg: #111316;
+  --mask: rgba(6,7,9,.62);
+}
+
+/* ---------- 浅色 ---------- */
+[data-theme="light"]{
+  --bg: #FFFFFF;
+  --surface: #FFFFFF;
+  --surface-2: #F7F7F5;
+  --surface-3: #EFEFED;
+  --surface-4: #E6E6E3;
+
+  --border: #E9E9E7;
+  --border-strong: #D9D9D5;
+
+  --text: #1F1F1E;
+  --text-2: #6F6F6B;
+  --text-3: #A0A09B;
+
+  --accent: #5A65D8;
+  --accent-hover: #4A55CC;
+  --accent-soft: rgba(90,101,216,.09);
+  --accent-line: rgba(90,101,216,.55);
+
+  --ok: #2E9E6B;
+  --ok-soft: rgba(46,158,107,.10);
+  --warn: #B5851F;
+  --warn-soft: rgba(181,133,31,.12);
+  --err: #D5453F;
+  --err-soft: rgba(213,69,63,.09);
+
+  --sel: rgba(90,101,216,.14);
+  --shadow-1: 0 1px 2px rgba(15,15,15,.06);
+  --shadow-2: 0 12px 32px rgba(15,15,15,.12), 0 2px 6px rgba(15,15,15,.05);
+  --grid-line: #F0F0EE;
+  --code-bg: #FAFAF9;
+  --sidebar-bg: #FBFAF9;
+  --mask: rgba(25,25,25,.28);
+}
+
+/* ---------- 重置 ---------- */
+* { box-sizing: border-box; }
+/* 关键：防止组件显式 display 覆盖 hidden 属性（UA 样式优先级低） */
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body{
+  margin: 0;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+button, input, select, textarea { font-family: inherit; font-size: inherit; color: inherit; }
+button { cursor: pointer; border: none; background: none; padding: 0; }
+input, textarea { outline: none; }
+svg { flex: none; display: block; }
+
+/* Linear / Notion 风格微型标签 */
+.micro{
+  font-size: 10.5px;
+  font-weight: 550;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+/* 滚动条：细、无轨道 */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb{
+  background: var(--border-strong);
+  border: 2.5px solid transparent;
+  background-clip: padding-box;
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--text-3); background-clip: padding-box; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+.mono { font-family: var(--mono); font-variant-ligatures: none; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 拖拽态 */
+body.is-resizing { user-select: none; cursor: col-resize; }
+body.is-resizing-v { user-select: none; cursor: row-resize; }
+
+/* 启动异常提示（正常使用时不应出现） */
+.boot-error{
+  position: fixed; left: 16px; bottom: 16px; z-index: 999;
+  max-width: 600px; padding: 12px 14px;
+  background: var(--err-soft); border: 1px solid var(--err);
+  border-radius: var(--r); color: var(--text);
+  font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap;
+}

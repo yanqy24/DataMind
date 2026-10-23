@@ -148,56 +148,12 @@ src-tauri/target/release/bundle/nsis/*.exe     # NSIS 安装包
 3. 点击连接的 **刷新结构记忆**，等待库表结构采集完成；
 4. 顶部切换 **快速模式 / Agent 模式**，在输入框用自然语言提问，回车即可。
 
-## 故障排查
-
-### 界面白屏 / 黑屏
-
-Windows 上 WebView2 的浏览器进程若被第三方模块注入并崩溃，宿主窗口仍在但页面无法渲染。  
-DataMind 内置守护逻辑：检测到崩溃后自动重建窗口（最多 2 次），仍失败则弹出系统提示。
-
-已知冲突源：**部分第三方输入法（如搜狗输入法）以 TSF 方式注入 WebView2 进程，会在初始化阶段使其崩溃**。规避方式：
-
-1. 临时切换为微软拼音（`Win + 空格`），再启动 DataMind；
-2. 更新或重装该输入法到最新版本；
-3. 在输入法设置中关闭「高级注入 / 浏览器兼容」相关选项（若有）。
-
-排查辅助：
-
-- 崩溃转储：`%LOCALAPPDATA%/com.datamind.app/EBWebView/Crashpad/reports/`
-- 前端自检日志：`%APPDATA%/com.datamind.app/diagnostic.log`
-
-### 数据库连接失败
-
-- MySQL 8 默认 `caching_sha2_password`：确保账号允许该认证方式，或改用 `mysql_native_password` 账号；
-- SSH 隧道连接时，SSH 用户需有端口转发权限；
-- 查询超过超时（默认 60s）会自动取消，状态栏会显示计时与取消按钮。
-
-### 中文乱码 / 问号
-
-若历史数据中存在编码问题（注释或字段值显示 `?????`、`鍝佺墝缂栧彿` 等乱码），DataMind 会在读取时自动尝试还原（GBK 乱码、cp1252 二次编码等）。需要进一步诊断时，可运行项目自带的只读探针：
-
-```bash
-cd src-tauri
-cargo run --release --example probe_charset -- "连接名" [抽样行数]   # 全库字符集体检
-cargo run --release --example probe_ddl    -- "连接名" [库名]        # DDL / 注释修复对照
-```
-
-注意：若数据在**写入**数据库时字节已丢失（如被转成 `?` 存储），任何客户端都无法还原，只能重新导入。
-
 ## 安全说明
 
 - **数据库只读**：所有 SQL 经 AST 解析，仅放行 `SELECT`；写操作在前后端双重拦截。
 - **凭据存储**：`connections.json` / `models.json` 以明文保存在本机应用数据目录（`%APPDATA%/com.datamind.app`），单机工具可接受；后续版本计划接入系统凭据库（Windows Credential Manager / Keychain）。
 - **SSH 主机密钥**：当前信任所有主机密钥（等同 `ssh -o StrictHostKeyChecking=no`），后续版本增加指纹确认。
 - **模型调用**：提示词中会包含库表结构（DDL / 注释 / 抽样），请确保你使用的模型服务条款允许传输这些内容；敏感库建议使用本地部署模型。
-
-## 路线图
-
-- [ ] PostgreSQL / ClickHouse 支持
-- [ ] SQL 语法补全
-- [ ] 连接凭据接入系统凭据库
-- [ ] SSH 主机密钥指纹确认
-- [ ] macOS / Linux / 移动端发布
 
 ## 贡献
 

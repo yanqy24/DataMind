@@ -9,6 +9,7 @@ import {
   dbOf,
   activeModel,
   generateSql,
+  cancelGenerate,
   quickFixSql,
   runSql,
   cancelSql,
@@ -87,6 +88,9 @@ function send() {
 }
 
 const generating = computed(() => !!state.generating[tab.value.id]);
+function stopGenerate() {
+  void cancelGenerate(tab.value);
+}
 const modelLabel = computed(() => activeModel.value?.name ?? "未选择模型");
 
 /* ---------- 两阶段生成：阶段进度 ---------- */
@@ -335,6 +339,9 @@ function persistSizes() {
                 <span class="composer__hint">Ctrl + Enter 发送 · 仅生成 SELECT</span>
                 <span class="tag tag--ghost" v-html="icon('spark', 11) + ' ' + modelLabel"></span>
                 <div style="flex:1"></div>
+                <button v-if="generating" class="btn btn--ghost btn--sm" @click="stopGenerate">
+                  停止
+                </button>
                 <button class="btn btn--primary btn--sm" :disabled="generating" @click="send">
                   <span v-html="icon('spark', 12)"></span> {{ generating ? "推理中…" : "生成 SQL" }}
                 </button>

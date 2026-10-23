@@ -1,5 +1,7 @@
 //! commands.rs — Tauri 命令层：前端 invoke 入口（薄封装，业务在 db / llm / store）
 
+use std::time::Duration;
+
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::error::AppError;
@@ -8,10 +10,17 @@ use crate::models::*;
 use crate::mysql::DbManager;
 use crate::store::Store;
 
-/// 全局共享状态
+/// SQL 生成整条流水线的总预算：模型单次调用 120s × 最多 6 次，超时即中止，
+/// 避免用户守着「推理中…」等十分钟。
+const GENERATE_BUDGET: Duration = Duration::from_secs(300);
+
+/// 全局共享状态。
+///
+/// `db` 是 `Arc` 而不是 `Mutex`：连接池内部自带短临界区，长查询 / 结构同步
+/// 不再互相串行，取消命令也无需排队等锁（详见 [crate::mysql::DbManager]）。
 pub struct AppState {
     pub store: std::sync::Arc<Store>,
-    pub db: tokio::sync::Mutex<DbManager>,
+    pub db: std::sync::Arc<DbManager>,
 }
 
 /* ---------- 连接 ---------- */
@@ -40,7 +49,7 @@ pub async fn conn_save(
     }
     state.store.save_connections(&list)?;
     // 配置变化后重建连接（销毁旧池 / 旧隧道）
-    state.db.lock().await.reset(&saved.id);
+    state.db.reset(&saved.id);
     Ok(saved)
 }
 
@@ -49,14 +58,14 @@ pub async fn conn_delete(id: String, state: State<'_, AppState>) -> Result<(), A
     let mut list = state.store.load_connections()?;
     list.retain(|c| c.id != id);
     state.store.save_connections(&list)?;
-    state.db.lock().await.reset(&id);
+    state.db.reset(&id);
     state.store.delete_memory(&id)?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn conn_test(conn: ConnConfig, state: State<'_, AppState>) -> Result<TestResult, AppError> {
-    let ms = state.db.lock().await.test(&conn).await?;
+    let ms = state.db.test(&conn).await?;
     Ok(TestResult { ok: true, ms: ms as u64, message: String::new() })
 }
 
@@ -83,8 +92,7 @@ pub async fn conn_sync(
             serde_json::json!({ "connId": id_for_event, "step": step }),
         );
     };
-    let mut db = state.db.lock().await;
-    db.sync_memory(&id, &progress).await
+    state.db.sync_memory(&id, &progress).await
 }
 
 #[tauri::command]
@@ -102,8 +110,7 @@ pub async fn table_detail(
     table: String,
     state: State<'_, AppState>,
 ) -> Result<TableDetail, AppError> {
-    let mut manager = state.db.lock().await;
-    manager.table_detail(&conn_id, &db, &table).await
+    state.db.table_detail(&conn_id, &db, &table).await
 }
 
 /* ---------- SQL 执行 ---------- */
@@ -118,10 +125,7 @@ pub async fn sql_execute(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<QueryResult, AppError> {
-    let result = {
-        let mut manager = state.db.lock().await;
-        manager.execute(&conn_id, &db, &sql, timeout_secs, &run_id).await
-    };
+    let result = state.db.execute(&conn_id, &db, &sql, timeout_secs, &run_id).await;
 
     // 记录执行日志（成功 / 失败 / 取消）
     let conn_name = state
@@ -152,13 +156,14 @@ pub async fn sql_execute(
 
 #[tauri::command]
 pub async fn sql_cancel(run_id: String, state: State<'_, AppState>) -> Result<bool, AppError> {
-    Ok(state.db.lock().await.cancel(&run_id))
+    Ok(state.db.cancel(&run_id))
 }
 
 /* ---------- SQL 生成（模型推理） ---------- */
 
 #[tauri::command]
 pub async fn sql_generate(
+    run_id: Option<String>,
     conn_id: String,
     db: String,
     table: String,
@@ -187,79 +192,108 @@ pub async fn sql_generate(
     }
 
     // 3. 推理：两阶段 Agent 模式（分析 → 探查 → 设计 → 生成 → 校验）
-    let mut steps: Vec<AgentStepView> = Vec::new();
-    // 模型配置在后续借用 state，这里先克隆出一份
+    //
+    // 整条链路可被 sql_cancel 的 run_id 中断，并受 GENERATE_BUDGET 总预算约束；
+    // 生成期间**不再独占数据库锁**，用户仍可正常查询 / 取消（见 AppState::db）。
+    let run_id = run_id.unwrap_or_else(|| format!("gen:{}", uuid::Uuid::new_v4()));
+    let token = state.db.begin_run(&run_id);
+    // 生成期间只持 Arc 克隆，不占用任何全局锁
+    let db_mgr = std::sync::Arc::clone(&state.db);
     let model_cfg = model.clone();
-    let (mut sql, note) = if agent.unwrap_or(true) && mode != "fix" {
-        let stage_labels: Vec<(String, String)> = vec![
-            ("schema".into(), "分析表结构".into()),
-            ("explore".into(), "探查真实数据".into()),
-            ("design".into(), "设计查询方案".into()),
-            ("build".into(), "生成 SQL".into()),
-            ("verify".into(), "校验 SQL".into()),
-        ];
-        let emit = |key: &str, _label: &str| {
-            let label = stage_labels
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, l)| l.clone())
-                .unwrap_or_else(|| key.to_string());
-            let _ = app.emit(
-                "sqlgen-stage",
-                serde_json::json!({ "stage": key, "label": label }),
-            );
-        };
-        let ctx = crate::agent::AgentCtx {
-            prompt: &prompt,
-            db: &db,
-            table: &table,
-            conn_id: &conn_id,
-            memory: memory.as_ref(),
-        };
-        let mut manager = state.db.lock().await;
-        match crate::agent::run(&model_cfg, &mut manager, ctx, &emit).await {
-            Ok(ans) => {
-                steps = ans
-                    .steps
+
+    let pipeline = async {
+        let mut steps: Vec<AgentStepView> = Vec::new();
+        let (sql, note) = if agent.unwrap_or(true) && mode != "fix" {
+            let stage_labels: Vec<(String, String)> = vec![
+                ("schema".into(), "分析表结构".into()),
+                ("explore".into(), "探查真实数据".into()),
+                ("design".into(), "设计查询方案".into()),
+                ("build".into(), "生成 SQL".into()),
+                ("verify".into(), "校验 SQL".into()),
+            ];
+            let emit = |key: &str, _label: &str| {
+                let label = stage_labels
                     .iter()
-                    .map(|s| AgentStepView {
-                        key: s.key.clone(),
-                        label: s.label.clone(),
-                        summary: s.summary.clone(),
-                        ok: s.ok,
-                    })
-                    .collect();
-                (ans.sql, ans.note)
-            }
-            Err(_e) => {
-                // Agent 链路失败 → 退化为单次直出，保证可用性
+                    .find(|(k, _)| k == key)
+                    .map(|(_, l)| l.clone())
+                    .unwrap_or_else(|| key.to_string());
                 let _ = app.emit(
                     "sqlgen-stage",
-                    serde_json::json!({ "stage": "fallback", "label": "降级为直出生成" }),
+                    serde_json::json!({ "stage": key, "label": label }),
                 );
-                let req = llm::GenerateReq {
-                    prompt: &prompt,
-                    mode: &mode,
-                    prev_sql: prev_sql.as_deref().unwrap_or(""),
-                    error: error.as_deref().unwrap_or(""),
-                    memory: memory.as_ref(),
-                    db: &db,
-                    table: &table,
-                };
-                llm::generate_sql(&model_cfg, req).await?
+            };
+            let ctx = crate::agent::AgentCtx {
+                prompt: &prompt,
+                db: &db,
+                table: &table,
+                conn_id: &conn_id,
+                memory: memory.as_ref(),
+            };
+            match crate::agent::run(&model_cfg, &db_mgr, ctx, &emit, &token).await {
+                Ok(ans) => {
+                    steps = ans
+                        .steps
+                        .iter()
+                        .map(|s| AgentStepView {
+                            key: s.key.clone(),
+                            label: s.label.clone(),
+                            summary: s.summary.clone(),
+                            ok: s.ok,
+                        })
+                        .collect();
+                    (ans.sql, ans.note)
+                }
+                // 用户主动取消 / 总预算超时：不要再降级重试，直接把中止结果返回
+                Err(e) if e.code == "CANCELLED" || e.code == "TIMEOUT" => return Err(e),
+                Err(_e) => {
+                    // Agent 链路失败 → 退化为单次直出，保证可用性
+                    let _ = app.emit(
+                        "sqlgen-stage",
+                        serde_json::json!({ "stage": "fallback", "label": "降级为直出生成" }),
+                    );
+                    let req = llm::GenerateReq {
+                        prompt: &prompt,
+                        mode: &mode,
+                        prev_sql: prev_sql.as_deref().unwrap_or(""),
+                        error: error.as_deref().unwrap_or(""),
+                        memory: memory.as_ref(),
+                        db: &db,
+                        table: &table,
+                    };
+                    llm::generate_sql(&model_cfg, req, &token).await?
+                }
             }
-        }
-    } else {
-        let req = llm::GenerateReq {
-            prompt: &prompt,
-            mode: &mode,
-            prev_sql: prev_sql.as_deref().unwrap_or(""),
-            error: error.as_deref().unwrap_or(""),
-            memory: memory.as_ref(),
-            db: &db,
-            table: &table,
+        } else {
+            let req = llm::GenerateReq {
+                prompt: &prompt,
+                mode: &mode,
+                prev_sql: prev_sql.as_deref().unwrap_or(""),
+                error: error.as_deref().unwrap_or(""),
+                memory: memory.as_ref(),
+                db: &db,
+                table: &table,
+            };
+            llm::generate_sql(&model_cfg, req, &token).await?
         };
-        llm::generate_sql(&model_cfg, req).await?
+        Ok::<(String, String, Vec<AgentStepView>), AppError>((sql, note, steps))
+    };
+
+    let generated = tokio::time::timeout(GENERATE_BUDGET, pipeline).await;
+    // 先注销登记，再处理结果：取消/超时路径不会留下悬挂的 run_id
+    state.db.end_run(&run_id);
+    let (mut sql, note, steps) = match generated {
+        Ok(r) => r?,
+        Err(_) => {
+            // 总预算耗尽：让仍在进行的模型请求 / 探查查询一起停下
+            token.cancel();
+            return Err(AppError::new(
+                "TIMEOUT",
+                format!(
+                    "生成耗时超过 {}s 已中止，请精简需求后重试",
+                    GENERATE_BUDGET.as_secs()
+                ),
+            ));
+        }
     };
 
     // 4. 只读保护：模型输出也必须通过 SELECT 校验
@@ -468,7 +502,7 @@ impl AppState {
     pub fn build(app: &tauri::App) -> Result<Self, AppError> {
         let dir = app.path().app_data_dir()?;
         let store = std::sync::Arc::new(Store::new(dir)?);
-        let db = tokio::sync::Mutex::new(DbManager::new(std::sync::Arc::clone(&store)));
+        let db = std::sync::Arc::new(DbManager::new(std::sync::Arc::clone(&store)));
         Ok(Self { store, db })
     }
 }

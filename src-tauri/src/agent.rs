@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::error::AppError;
 use crate::models::{ConnMemory, ModelConfig};
 use crate::mysql::DbManager;
@@ -66,24 +68,40 @@ fn rules() -> String {
     )
 }
 
-/// 主流程：任何阶段失败都降级继续，最终无法生成 SQL 才报错
+/// 阶段边界检查：用户取消 / 生成预算耗尽时尽快退出，不再白跑后续阶段
+fn ensure_alive(cancel: &CancellationToken) -> Result<(), AppError> {
+    if cancel.is_cancelled() {
+        Err(AppError::new("CANCELLED", "已取消生成"))
+    } else {
+        Ok(())
+    }
+}
+
+/// 主流程：任何阶段失败都降级继续，最终无法生成 SQL 才报错。
+///
+/// `cancel` 在每个阶段边界检查一次，并透传给模型调用与库内探查：
+/// 用户点「停止」后最多再等一次网络往返即退出，不再独占数据库十分钟。
 pub async fn run(
     model: &ModelConfig,
-    db: &mut DbManager,
+    db: &DbManager,
     ctx: AgentCtx<'_>,
     on_stage: &(dyn Fn(&str, &str) + Send + Sync),
+    cancel: &CancellationToken,
 ) -> Result<AgentAnswer, AppError> {
     let mut steps: Vec<AgentStep> = Vec::new();
 
     /* ---------- 1. Schema 分析 ---------- */
+    ensure_alive(cancel)?;
     on_stage("schema", "分析表结构");
     let digest = schema_digest(ctx.memory, ctx.db, ctx.table, ctx.prompt);
-    let analysis = match stage_schema(model, &digest, ctx.prompt, ctx.table).await {
+    let analysis = match stage_schema(model, &digest, ctx.prompt, ctx.table, cancel).await {
         Ok(a) => {
             let summary = a.summary();
             steps.push(step("schema", "结构分析", &summary, true));
             a
         }
+        // 取消不是「失败」：不能降级成关键词兜底继续跑
+        Err(e) if e.code == "CANCELLED" => return Err(e),
         Err(e) => {
             steps.push(step(
                 "schema",
@@ -96,18 +114,21 @@ pub async fn run(
     };
 
     /* ---------- 2. 数据探查 ---------- */
+    ensure_alive(cancel)?;
     on_stage("explore", "探查真实数据");
-    let (findings, ok) = stage_explore(db, ctx.conn_id, ctx.db, &analysis, ctx.memory).await;
+    let (findings, ok) = stage_explore(db, ctx.conn_id, ctx.db, &analysis, ctx.memory, cancel).await;
     steps.push(step("explore", "数据探查", &findings, ok));
 
     /* ---------- 3. SQL 设计 ---------- */
+    ensure_alive(cancel)?;
     on_stage("design", "设计查询方案");
-    let design = match stage_design(model, &digest, &analysis, &findings, ctx.prompt).await {
+    let design = match stage_design(model, &digest, &analysis, &findings, ctx.prompt, cancel).await {
         Ok(d) => {
             let s = d.clone();
             steps.push(step("design", "方案设计", &s, true));
             s
         }
+        Err(e) if e.code == "CANCELLED" => return Err(e),
         Err(e) => {
             steps.push(step(
                 "design",
@@ -120,29 +141,50 @@ pub async fn run(
     };
 
     /* ---------- 4. SQL 生成 ---------- */
+    ensure_alive(cancel)?;
     on_stage("build", "生成 SQL");
     let detail = schema_detail(ctx.memory, ctx.db, &analysis);
-    let (mut sql, mut note) = stage_build(model, &detail, &design, &findings, ctx.prompt, "").await?;
+    let (mut sql, mut note) =
+        stage_build(model, &detail, &design, &findings, ctx.prompt, "", cancel).await?;
     steps.push(step("build", "SQL 生成", &format!("{}\n{}", note, sql), true));
 
     /* ---------- 5. SQL 校验（最多修 1 轮） ---------- */
+    ensure_alive(cancel)?;
     on_stage("verify", "校验 SQL");
     let mut issues = deterministic_check(&sql, ctx.memory, ctx.db);
-    // 有真实连接时才做 EXPLAIN；否则（如快速修复 / 无连接场景）只做静态校验
+    // 有真实连接时才做 EXPLAIN；否则（如快速修复 / 无连接场景）只做静态校验。
+    // 关键：EXPLAIN 也可能执行语句（EXPLAIN ANALYZE DML），未通过只读校验的 SQL 绝不能送进去。
+    let sql_is_select = crate::guard::ensure_select_only(&sql).is_ok();
     if !ctx.conn_id.is_empty() {
-        if let Err(e) = db.explain(ctx.conn_id, ctx.db, &sql).await {
-            issues.push(format!("数据库执行计划检查未通过：{}", e.message));
+        if sql_is_select {
+            if let Err(e) = db.explain(ctx.conn_id, ctx.db, &sql).await {
+                issues.push(format!("数据库执行计划检查未通过：{}", e.message));
+            }
+        } else {
+            issues.push("已跳过执行计划检查：SQL 未通过只读校验".into());
         }
     }
 
     if !issues.is_empty() {
         // 带着问题重新生成一次
         on_stage("build", "按校验结果重写 SQL");
+        ensure_alive(cancel)?;
         let fix_hint = format!("上一版 SQL 存在问题，请修正：\n- {}", issues.join("\n- "));
-        if let Ok((s2, n2)) = stage_build(model, &detail, &design, &findings, ctx.prompt, &fix_hint).await {
+        // 重写一轮也允许被取消：取消是「立即退出」语义，不能降级成「继续下一阶段」
+        let rewritten = match stage_build(model, &detail, &design, &findings, ctx.prompt, &fix_hint, cancel).await {
+            Ok(v) => Some(v),
+            Err(e) if e.code == "CANCELLED" => return Err(e),
+            Err(_) => None,
+        };
+        if let Some((s2, n2)) = rewritten {
             let mut issues2 = deterministic_check(&s2, ctx.memory, ctx.db);
-            if !ctx.conn_id.is_empty() && db.explain(ctx.conn_id, ctx.db, &s2).await.is_err() {
-                issues2.push("修正版仍未通过执行计划检查".into());
+            if !ctx.conn_id.is_empty() {
+                // 同样先过只读校验，避免 EXPLAIN 变成执行入口
+                if crate::guard::ensure_select_only(&s2).is_err() {
+                    issues2.push("修正版未通过只读校验".into());
+                } else if db.explain(ctx.conn_id, ctx.db, &s2).await.is_err() {
+                    issues2.push("修正版仍未通过执行计划检查".into());
+                }
             }
             if issues2.len() < issues.len() {
                 sql = s2;
@@ -159,7 +201,8 @@ pub async fn run(
     }
 
     // 模型复审：确认是否满足设计意图
-    let review = stage_review(model, &detail, &design, &findings, &sql, ctx.prompt).await;
+    ensure_alive(cancel)?;
+    let review = stage_review(model, &detail, &design, &findings, &sql, ctx.prompt, cancel).await;
     match review {
         Ok(r) => {
             steps.push(step(
@@ -185,6 +228,7 @@ pub async fn run(
                 note = r.issues.join("；");
             }
         }
+        Err(e) if e.code == "CANCELLED" => return Err(e),
         Err(e) => {
             steps.push(step(
                 "verify",
@@ -263,6 +307,7 @@ async fn stage_schema(
     digest: &str,
     prompt: &str,
     table: &str,
+    cancel: &CancellationToken,
 ) -> Result<Analysis, AppError> {
     let system = format!(
         "你是数据库结构分析专家。根据用户问题，从给定表结构中挑出真正需要的表与关键字段。\n\
@@ -286,7 +331,7 @@ async fn stage_schema(
         },
         digest
     );
-    let content = crate::llm::chat(model, &system, &user, 0.0).await?;
+    let content = crate::llm::chat(model, &system, &user, 0.0, cancel).await?;
     let v = crate::llm::json_from(&content)
         .ok_or_else(|| AppError::new("LLM_PARSE", "结构分析结果无法解析为 JSON"))?;
     let strs = |key: &str| -> Vec<String> {
@@ -320,12 +365,16 @@ async fn stage_schema(
 /* ---------- 2. 数据探查 ---------- */
 
 async fn stage_explore(
-    db: &mut DbManager,
+    db: &DbManager,
     conn_id: &str,
     schema_db: &str,
     analysis: &Analysis,
     memory: Option<&ConnMemory>,
+    cancel: &CancellationToken,
 ) -> (String, bool) {
+    if cancel.is_cancelled() {
+        return ("已取消，跳过数据探查".into(), false);
+    }
     if conn_id.is_empty() || schema_db.is_empty() {
         return ("未连接数据库，跳过数据探查".into(), false);
     }
@@ -344,6 +393,11 @@ async fn stage_explore(
     }
 
     for t in &tables {
+        // 每次探查最长 15s，取消后不再为剩余表白等
+        if cancel.is_cancelled() {
+            out.push_str("（已取消，剩余表未探查）\n");
+            break;
+        }
         let cols = pick_columns(memory, schema_db, t, analysis);
         if cols.is_empty() {
             continue;
@@ -418,7 +472,7 @@ fn pick_columns(memory: Option<&ConnMemory>, db: &str, table: &str, analysis: &A
 
 /// 对单表跑一次聚合探查（行数 / NULL 率 / distinct / min / max）+ 低基数列的取值分布
 async fn probe_table(
-    db: &mut DbManager,
+    db: &DbManager,
     conn_id: &str,
     schema_db: &str,
     table: &str,
@@ -579,6 +633,7 @@ async fn stage_design(
     analysis: &Analysis,
     findings: &str,
     prompt: &str,
+    cancel: &CancellationToken,
 ) -> Result<String, AppError> {
     let system = format!(
         "你是资深数据分析方案设计专家。基于结构分析与数据探查结论，设计查询方案（不要写 SQL）。\n\
@@ -596,7 +651,7 @@ async fn stage_design(
         findings,
         digest
     );
-    let content = crate::llm::chat(model, &system, &user, 0.1).await?;
+    let content = crate::llm::chat(model, &system, &user, 0.1, cancel).await?;
     let v = crate::llm::json_from(&content)
         .ok_or_else(|| AppError::new("LLM_PARSE", "设计方案无法解析为 JSON"))?;
     let mut out = String::new();
@@ -643,6 +698,7 @@ async fn stage_build(
     findings: &str,
     prompt: &str,
     fix_hint: &str,
+    cancel: &CancellationToken,
 ) -> Result<(String, String), AppError> {
     let system = format!(
         "你是资深 MySQL 数据分析专家，按给定的查询方案产出一条可直接执行的 SELECT。\n\
@@ -667,7 +723,7 @@ async fn stage_build(
             format!("\n\n{}", fix_hint)
         }
     );
-    let content = crate::llm::chat(model, &system, &user, 0.1).await?;
+    let content = crate::llm::chat(model, &system, &user, 0.1, cancel).await?;
     let (sql, note) = crate::llm::parse_answer(&content)?;
     Ok((sql, note))
 }
@@ -689,6 +745,7 @@ async fn stage_review(
     findings: &str,
     sql: &str,
     prompt: &str,
+    cancel: &CancellationToken,
 ) -> Result<Review, AppError> {
     let system = format!(
         "你是 SQL 审查专家。检查下面这条 SQL 是否满足用户意图与查询方案，并指出问题。\n\
@@ -706,7 +763,7 @@ async fn stage_review(
         "用户问题：{}\n\n查询方案：\n{}\n\n数据探查结论：\n{}\n\n表结构详情：\n{}\n\n待校验 SQL：\n{}",
         prompt, design, findings, detail, sql
     );
-    let content = crate::llm::chat(model, &system, &user, 0.0).await?;
+    let content = crate::llm::chat(model, &system, &user, 0.0, cancel).await?;
     let v = crate::llm::json_from(&content)
         .ok_or_else(|| AppError::new("LLM_PARSE", "校验结果无法解析为 JSON"))?;
     Ok(Review {
@@ -997,6 +1054,37 @@ mod tests {
         }
     }
 
+    /// 取消后流水线必须立刻退出：不调用模型、不碰数据库，直接返回 CANCELLED
+    #[tokio::test]
+    async fn cancelled_pipeline_stops_immediately() {
+        let (base, _h) = fake_llm().await;
+        let model = ModelConfig {
+            id: "m1".into(),
+            name: "fake".into(),
+            provider: "openai".into(),
+            base_url: base,
+            api_key: "k".into(),
+            model_id: "fake-model".into(),
+            active: true,
+        };
+        let dir = std::env::temp_dir()
+            .join(format!("dm-agent-cancel-{}", chrono::Utc::now().timestamp_millis()));
+        let store = Arc::new(crate::store::Store::new(dir).unwrap());
+        let db = DbManager::new(store);
+        let mem = memory();
+        let ctx = AgentCtx {
+            prompt: "统计近 7 天的订单数",
+            db: "shop",
+            table: "orders",
+            conn_id: "not-connected",
+            memory: Some(&mem),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = run(&model, &db, ctx, &|_k, _l| {}, &cancel).await.unwrap_err();
+        assert_eq!(err.code, "CANCELLED", "取消应立刻返回：{err}");
+    }
+
     /// 起一个假 /chat/completions：按请求里出现的阶段关键词返回对应 JSON
     async fn fake_llm() -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1049,7 +1137,7 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("dm-agent-test-{}", chrono::Utc::now().timestamp_millis()));
         let store = Arc::new(crate::store::Store::new(dir).unwrap());
-        let mut db = DbManager::new(store);
+        let db = DbManager::new(store);
         let mem = memory();
         let ctx = AgentCtx {
             prompt: "统计近 7 天的订单数",
@@ -1058,7 +1146,8 @@ mod tests {
             conn_id: "", // 无真实连接 → 探查阶段跳过
             memory: Some(&mem),
         };
-        let ans = run(&model, &mut db, ctx, &|_k, _l| {}).await.unwrap();
+        let cancel = CancellationToken::new();
+        let ans = run(&model, &db, ctx, &|_k, _l| {}, &cancel).await.unwrap();
         assert!(ans.sql.to_lowercase().starts_with("select"), "SQL 应为 SELECT：{}", ans.sql);
         assert!(ans.sql.to_lowercase().contains("limit"), "应带 LIMIT：{}", ans.sql);
         let keys: Vec<&str> = ans.steps.iter().map(|s| s.key.as_str()).collect();

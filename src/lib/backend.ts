@@ -51,8 +51,9 @@ export const apiSql = {
     timeoutSecs: number;
   }) => invoke<QueryResult>("sql_execute", p),
   cancel: (runId: string) => invoke<void>("sql_cancel", { runId }),
-  /** 模型推理生成 SQL；mode=fix 为错误修复 */
+  /** 模型推理生成 SQL；mode=fix 为错误修复（runId 供取消用） */
   generate: (p: {
+    runId: string;
     connId: string;
     db: string;
     table: string;

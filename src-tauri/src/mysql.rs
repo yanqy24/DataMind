@@ -2,11 +2,16 @@
 //!
 //! 安全约束：
 //! - 执行前经 [crate::guard] 的 AST 校验，仅放行 SELECT
-//! - 单次执行受超时（默认 60s）与取消（run_id -> CancellationToken）双重控制
+//! - 单次执行受超时（默认 60s）与取消（run_id -> CancellationToken）双重控制；
+//!   超时 / 取消都会主动断开该连接并向服务端补发 KILL QUERY，避免语句在库上继续跑
 //! - 结果集超过 5000 行硬截断，配合 SQL 级 LIMIT 保护内存
+//!
+//! 并发模型：连接池 / 隧道的增删由一把**短临界区**互斥锁保护，只在取连接的那一刻持锁；
+//! 查询与结构同步本身不持有任何全局锁，因此慢查询不会互相阻塞，也不会阻塞取消
+//! （取消走独立的 [RunningRegistry]，不需要等待正在执行的查询）。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use mysql_async::consts::ColumnType;
@@ -45,20 +50,67 @@ const CONN_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct DbManager {
     store: Arc<Store>,
+    /// 连接池与 SSH 隧道。临界区只包住「查表 / 插表」，绝不跨 await 持有。
+    conns: StdMutex<ConnPoolSet>,
+    /// 建连闸门：同一条连接被并发请求时只建一次池、一次隧道
+    connect: tokio::sync::Mutex<()>,
+    /// run_id -> 取消令牌。独立于连接池，取消路径无需任何锁等待。
+    running: RunningRegistry,
+}
+
+#[derive(Default)]
+struct ConnPoolSet {
     pools: HashMap<String, Pool>,
     tunnels: HashMap<String, Tunnel>,
-    /// run_id -> 取消令牌
-    running: HashMap<String, CancellationToken>,
+}
+
+/// 运行中任务登记表（查询与 SQL 生成共用同一套 run_id 命名空间）。
+///
+/// 用 `std::sync::Mutex` 而不是 `tokio::sync::Mutex`：临界区里只做 HashMap 操作，
+/// 不跨 await，且取消是同步语义——必须能在「数据库正忙」时立刻生效。
+#[derive(Default)]
+pub struct RunningRegistry {
+    map: StdMutex<HashMap<String, CancellationToken>>,
+}
+
+impl RunningRegistry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CancellationToken>> {
+        // 锁中毒时沿用内部数据：这里存的是取消令牌，不存在被破坏的不变量
+        self.map.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn insert(&self, run_id: &str, token: CancellationToken) {
+        self.lock().insert(run_id.to_string(), token);
+    }
+
+    fn remove(&self, run_id: &str) -> Option<CancellationToken> {
+        self.lock().remove(run_id)
+    }
+
+    /// 取消指定任务；返回是否命中。命中即已发出信号，调用方无需等待任务收尾。
+    pub fn cancel(&self, run_id: &str) -> bool {
+        match self.lock().get(run_id) {
+            Some(t) => {
+                t.cancel();
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl DbManager {
     pub fn new(store: Arc<Store>) -> Self {
         Self {
             store,
-            pools: HashMap::new(),
-            tunnels: HashMap::new(),
-            running: HashMap::new(),
+            conns: StdMutex::new(ConnPoolSet::default()),
+            connect: tokio::sync::Mutex::new(()),
+            running: RunningRegistry::default(),
         }
+    }
+
+    fn conns(&self) -> std::sync::MutexGuard<'_, ConnPoolSet> {
+        self.conns.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn find_config(&self, conn_id: &str) -> Result<ConnConfig, AppError> {
@@ -69,32 +121,76 @@ impl DbManager {
             .ok_or_else(|| AppError::new("NO_CONN", "连接不存在，请重新选择"))
     }
 
+    /// 登记一个可取消任务（查询 / 生成共用），返回其取消令牌
+    pub fn begin_run(&self, run_id: &str) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.running.insert(run_id, token.clone());
+        token
+    }
+
+    /// 注销任务登记（任务结束 / 失败 / 取消后都必须调用）
+    pub fn end_run(&self, run_id: &str) {
+        self.running.remove(run_id);
+    }
+
+    /// 取消指定 run_id 的执行（查询或生成）。
+    ///
+    /// 不触碰 `connect` 闸门、也不等待 DbManager 内部锁，因此**在长查询执行期间调用也能立刻返回**。
+    pub fn cancel(&self, run_id: &str) -> bool {
+        self.running.cancel(run_id)
+    }
+
     /// 连接配置变化 / 删除后，销毁旧连接池与隧道
-    pub fn reset(&mut self, conn_id: &str) {
-        self.pools.remove(conn_id);
-        if let Some(t) = self.tunnels.remove(conn_id) {
+    pub fn reset(&self, conn_id: &str) {
+        let (pool, tunnel) = {
+            let mut set = self.conns();
+            (set.pools.remove(conn_id), set.tunnels.remove(conn_id))
+        };
+        drop(pool);
+        if let Some(t) = tunnel {
             t.stop();
         }
     }
 
+    fn pool_of(&self, conn_id: &str) -> Option<Pool> {
+        self.conns().pools.get(conn_id).cloned()
+    }
+
+    fn tunnel_port(&self, conn_id: &str) -> Option<u16> {
+        self.conns().tunnels.get(conn_id).map(|t| t.local_port)
+    }
+
     /// 取得 MySQL 访问端点（必要时建立 SSH 隧道）
-    async fn endpoint(&mut self, cfg: &ConnConfig) -> Result<(String, u16), AppError> {
+    async fn endpoint(&self, cfg: &ConnConfig) -> Result<(String, u16), AppError> {
         if !cfg.ssh.enabled {
             return Ok((cfg.host.clone(), cfg.port));
         }
-        if let Some(t) = self.tunnels.get(&cfg.id) {
-            return Ok(("127.0.0.1".into(), t.local_port));
+        if let Some(port) = self.tunnel_port(&cfg.id) {
+            return Ok(("127.0.0.1".into(), port));
         }
         let t = Tunnel::start(&cfg.ssh, &cfg.host, cfg.port).await?;
         let port = t.local_port;
-        self.tunnels.insert(cfg.id.clone(), t);
+        // 并发下可能已被别的任务抢先建好隧道：保留先到的，后来者就地关闭
+        let mut set = self.conns();
+        let port = match set.tunnels.entry(cfg.id.clone()) {
+            std::collections::hash_map::Entry::Occupied(o) => o.get().local_port,
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(t);
+                port
+            }
+        };
         Ok(("127.0.0.1".into(), port))
     }
 
     /// 取得（或建立）连接池
-    async fn ensure_pool(&mut self, conn_id: &str) -> Result<Pool, AppError> {
-        if let Some(p) = self.pools.get(conn_id) {
-            return Ok(p.clone());
+    async fn ensure_pool(&self, conn_id: &str) -> Result<Pool, AppError> {
+        if let Some(p) = self.pool_of(conn_id) {
+            return Ok(p);
+        }
+        // 只有「建池 / 建隧道」走串行；拿到池后立刻释放闸门，查询之间互不阻塞
+        let _gate = self.connect.lock().await;
+        if let Some(p) = self.pool_of(conn_id) {
+            return Ok(p);
         }
         let cfg = self.find_config(conn_id)?;
         let (host, port) = self.endpoint(&cfg).await?;
@@ -104,14 +200,14 @@ impl DbManager {
             .await
             .map_err(|_| AppError::new("2003", "连接 MySQL 超时，请检查网络或 SSH 隧道"))??;
         drop(conn);
-        self.pools.insert(conn_id.to_string(), pool.clone());
+        self.conns().pools.insert(conn_id.to_string(), pool.clone());
         Ok(pool)
     }
 
     /// 取一条「活着」的连接：长时间闲置后，服务端 wait_timeout / 防火墙 / SSH 隧道
     /// 可能已单方面关闭连接，池中连接看似存在实则不可用。
     /// 这里先做一次心跳校验（SELECT 1），失败则销毁池与隧道后重建，再取一次。
-    async fn healthy_conn(&mut self, conn_id: &str) -> Result<mysql_async::Conn, AppError> {
+    async fn healthy_conn(&self, conn_id: &str) -> Result<mysql_async::Conn, AppError> {
         let mut last = AppError::new("2003", "获取连接失败：连接不可用");
         for _attempt in 0..2u8 {
             let pool = match self.ensure_pool(conn_id).await {
@@ -150,7 +246,7 @@ impl DbManager {
     }
 
     /// 测试连接（不落库，测试配置草稿）
-    pub async fn test(&mut self, cfg: &ConnConfig) -> Result<u128, AppError> {
+    pub async fn test(&self, cfg: &ConnConfig) -> Result<u128, AppError> {
         let start = Instant::now();
         let mut tunnel = None;
         let (host, port) = if cfg.ssh.enabled {
@@ -172,7 +268,7 @@ impl DbManager {
 
     /// 全量读取连接下所有库的 DDL / 列 / 关系 / 取样，形成本地记忆
     pub async fn sync_memory(
-        &mut self,
+        &self,
         conn_id: &str,
         progress: &(dyn Fn(&str) + Send + Sync),
     ) -> Result<ConnMemory, AppError> {
@@ -327,7 +423,7 @@ impl DbManager {
     /// 不走本地记忆：记忆可能是旧版本在错误字符集下采集的（当时注释已被服务端转成 '?'），
     /// 这里直接向数据库要最新文本，保证显示与当前库一致。
     pub async fn table_detail(
-        &mut self,
+        &self,
         conn_id: &str,
         db: &str,
         table: &str,
@@ -376,7 +472,7 @@ impl DbManager {
     /// 执行只读 SELECT（超时自动取消；run_id 可被 [Self::cancel] 手动取消）
     /// 若连接在执行途中被断开（闲置超时 / 网络中断），自动重建连接重试一次
     pub async fn execute(
-        &mut self,
+        &self,
         conn_id: &str,
         db: &str,
         sql: &str,
@@ -386,13 +482,19 @@ impl DbManager {
         guard::ensure_select_only(sql)?;
         let sql_capped = guard::with_safe_limit(sql);
 
+        // 令牌建在重试循环之外：用户取消对「重建连接后的第二次尝试」同样有效
+        let token = self.begin_run(run_id);
         let mut last: Option<AppError> = None;
         for attempt in 0..2u8 {
+            if token.is_cancelled() {
+                self.end_run(run_id);
+                return Err(AppError::new("CANCELLED", "已取消执行"));
+            }
             let r = self
-                .execute_once(conn_id, db, sql_capped.clone(), timeout_secs, run_id)
+                .execute_once(conn_id, db, sql_capped.clone(), timeout_secs, &token)
                 .await;
             match r {
-                Err(e) if e.conn_broken && attempt == 0 => {
+                Err(e) if e.conn_broken && attempt == 0 && !token.is_cancelled() => {
                     trace_conn(&format!(
                         "CONN_BROKEN conn={} err={} → 重建连接并重试一次",
                         conn_id, e.message
@@ -401,64 +503,116 @@ impl DbManager {
                     self.reset(conn_id); // 销毁失效连接池（含隧道），下一轮重建
                     continue;
                 }
-                other => return other,
+                other => {
+                    self.end_run(run_id);
+                    return other;
+                }
             }
         }
+        self.end_run(run_id);
         Err(last.unwrap_or_else(|| AppError::new("MYSQL", "执行失败")))
     }
 
     /// 单次执行（不含重连重试）
     async fn execute_once(
-        &mut self,
+        &self,
         conn_id: &str,
         db: &str,
         sql_capped: String,
         timeout_secs: u64,
-        run_id: &str,
+        token: &CancellationToken,
     ) -> Result<QueryResult, AppError> {
+        // 取连接期间用户可能已经取消（拿连接本身可能要等上几秒）
+        if token.is_cancelled() {
+            return Err(AppError::new("CANCELLED", "已取消执行"));
+        }
         let mut conn = self.healthy_conn(conn_id).await?;
         if !db.is_empty() {
             conn.query_drop(format!("USE `{}`", db.replace('`', "``")))
                 .await?;
         }
 
+        // 服务端线程 id：超时 / 取消后用它发 KILL QUERY，让语句真正停下来
+        let thread_id = conn.id();
         let start = Instant::now();
-        let token = CancellationToken::new();
-        let token_task = token.clone();
-        self.running.insert(run_id.to_string(), token);
+        let task_token = token.clone();
         let (tx, rx) = oneshot::channel::<Result<Vec<Row>, AppError>>();
 
         tokio::spawn(async move {
-            let res: Result<Vec<Row>, AppError> = tokio::select! {
-                _ = token_task.cancelled() => Err(AppError::new("CANCELLED", "已取消执行")),
-                r = conn.query(&sql_capped) => r.map_err(AppError::from),
+            // select! 先轮询取消分支：取消时立刻丢弃查询 future（等价于中断请求）
+            let res: Option<Result<Vec<Row>, AppError>> = tokio::select! {
+                biased;
+                _ = task_token.cancelled() => None,
+                r = conn.query::<Row, _>(&sql_capped) => Some(r.map_err(AppError::from)),
             };
-            let _ = tx.send(res);
+            match res {
+                Some(r) => {
+                    let _ = tx.send(r);
+                }
+                None => {
+                    // 被中断的查询会让协议流失去同步，这条连接不能还回池复用，直接断开
+                    let _ = conn.disconnect().await;
+                    let _ = tx.send(Err(AppError::new("CANCELLED", "已取消执行")));
+                }
+            }
         });
 
         let out = tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), rx).await;
-        self.running.remove(run_id);
         match out {
             Err(_) => {
-                if let Some(t) = self.running.remove(run_id) {
-                    t.cancel(); // 通知任务中止并释放连接
-                }
+                // 客户端超时：先通知任务中止，再补一刀 KILL QUERY
+                // （此前这里第二次 remove 恒为 None，取消从未真正生效）
+                token.cancel();
+                self.kill_query(conn_id, thread_id);
                 Err(AppError::new(
                     "TIMEOUT",
                     format!("执行超过 {timeout_secs}s，已自动取消"),
                 ))
             }
             Ok(Err(_)) => Err(AppError::new("CANCELLED", "已取消执行")),
-            Ok(Ok(Err(e))) => Err(e),
+            Ok(Ok(Err(e))) => {
+                // 手动取消同样要让服务端停下（令牌已由 cancel() 发出，这里补服务端侧）
+                if e.code == "CANCELLED" {
+                    self.kill_query(conn_id, thread_id);
+                }
+                Err(e)
+            }
             Ok(Ok(Ok(rows))) => Ok(convert_rows(rows, start.elapsed().as_millis() as u64)),
         }
+    }
+
+    /// 请求服务端终止指定线程上的语句（尽力而为：权限不足或连接已断时静默失败）。
+    ///
+    /// 客户端断开 socket 未必能让 MySQL 停下正在执行的语句，必须显式 KILL QUERY。
+    /// 这里丢到后台执行：取消 / 超时的响应不该再多等一个取连接的往返。
+    fn kill_query(&self, conn_id: &str, thread_id: u32) {
+        let Some(pool) = self.pool_of(conn_id) else {
+            return;
+        };
+        let conn_id = conn_id.to_string();
+        tokio::spawn(async move {
+            let Ok(Ok(mut conn)) =
+                tokio::time::timeout(Duration::from_secs(5), pool.get_conn()).await
+            else {
+                trace_conn(&format!("KILL_QUERY conn={conn_id} 取连接失败，跳过"));
+                return;
+            };
+            match conn.query_drop(format!("KILL QUERY {thread_id}")).await {
+                Ok(_) => trace_conn(&format!(
+                    "KILL_QUERY conn={conn_id} thread={thread_id} 已发送"
+                )),
+                Err(e) => trace_conn(&format!(
+                    "KILL_QUERY conn={conn_id} thread={thread_id} 失败：{e}"
+                )),
+            }
+        });
     }
 
     /* ---------- 数据探查（Agent 模式：生成 SQL 前主动摸清真实数据） ---------- */
 
     /// 跑一条只读探查 SQL（走同一套超时/取消/只读保护）
     pub async fn probe_query(
-        &mut self,
+        &self,
         conn_id: &str,
         db: &str,
         sql: &str,
@@ -468,33 +622,23 @@ impl DbManager {
         self.execute(conn_id, db, sql, timeout_secs, &run_id).await
     }
 
-    /// 用 EXPLAIN 验证 SQL 可执行（字段/表是否存在）。SQL 已通过只读校验，EXPLAIN 只读无害。
-    pub async fn explain(
-        &mut self,
-        conn_id: &str,
-        db: &str,
-        sql: &str,
-    ) -> Result<(), AppError> {
+    /// 用 EXPLAIN 验证 SQL 可执行（字段/表是否存在）。
+    ///
+    /// 注意：EXPLAIN **不总是只读**——MySQL 8.0.18+ 的 `EXPLAIN ANALYZE <DML>` 会真正执行语句。
+    /// 因此这里必须自己再校验一次，不能依赖调用方「应该已经校验过」（纵深防御）。
+    pub async fn explain(&self, conn_id: &str, db: &str, sql: &str) -> Result<(), AppError> {
+        guard::ensure_select_only(sql)?;
         let mut conn = self.healthy_conn(conn_id).await?;
         if !db.is_empty() {
             conn.query_drop(format!("USE `{}`", db.replace('`', "``")))
                 .await?;
         }
+        // 固定用不带 ANALYZE 的 EXPLAIN，保证不会真实执行语句
         let q = format!("EXPLAIN {}", sql);
         tokio::time::timeout(Duration::from_secs(15), conn.query_drop(q))
             .await
             .map_err(|_| AppError::new("EXPLAIN_TIMEOUT", "执行计划检查超时"))?
             .map_err(AppError::from)
-    }
-
-    /// 取消指定 run_id 的执行
-    pub fn cancel(&mut self, run_id: &str) -> bool {
-        if let Some(t) = self.running.get(run_id) {
-            t.cancel();
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -1180,5 +1324,79 @@ mod repair_tests {
         let fixed = decode_bytes("鐘舵?".as_bytes(), "c", true);
         assert!(fixed.starts_with('状'), "fixed={fixed}");
         assert!(!fixed.contains('鐘'), "fixed={fixed}");
+    }
+}
+
+/* ---------- 测试：取消登记与只读前置校验 ---------- */
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    fn temp_db() -> DbManager {
+        let dir = std::env::temp_dir().join(format!(
+            "dm-cancel-test-{}",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        DbManager::new(Arc::new(Store::new(dir).unwrap()))
+    }
+
+    /// 取消的基础不变量：命中即真的发出信号；未登记 / 已注销一律 miss，
+    /// 保证「取消」既不会失效，也不会误伤别的任务。
+    #[test]
+    fn cancel_hits_registered_run_only() {
+        let db = temp_db();
+        let token = db.begin_run("run-1");
+        assert!(!token.is_cancelled());
+
+        assert!(db.cancel("run-1"), "已登记的任务必须能被取消");
+        assert!(token.is_cancelled(), "cancel 必须真的触发令牌");
+        assert!(!db.cancel("run-2"), "未登记的 run_id 不应返回命中");
+
+        db.end_run("run-1");
+        assert!(!db.cancel("run-1"), "任务结束后再取消应返回 miss");
+    }
+
+    /// 超时路径依赖「先取令牌、再取消」的顺序：登记项被提前摘除会导致取消落空。
+    /// 这里锁住该行为——令牌仍然有效（未 end_run 时）。
+    #[test]
+    fn cancel_still_works_after_lookup() {
+        let db = temp_db();
+        let token = db.begin_run("run-3");
+        let registered = db.running.remove("run-3");
+        if let Some(t) = registered {
+            t.cancel();
+        }
+        assert!(token.is_cancelled());
+    }
+
+    /// A3：EXPLAIN 前必须先过只读校验。这里连接根本不存在，
+    /// 若先建连接会报 NO_CONN；实际返回 1142 证明校验发生在最前面。
+    #[tokio::test]
+    async fn explain_rejects_non_select_before_connecting() {
+        let db = temp_db();
+        let err = db
+            .explain("no-such-conn", "shop", "DELETE FROM orders")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "1142", "应当在只读校验处被拦截：{err}");
+
+        // 最危险的变体：拼成 `EXPLAIN ANALYZE ...` 后 MySQL 会真正执行语句。
+        // 无论被解析层拒还是被语义层拒，都必须在「触碰数据库」之前发生。
+        let err = db
+            .explain("no-such-conn", "shop", "ANALYZE DELETE FROM orders")
+            .await
+            .unwrap_err();
+        assert_ne!(err.code, "NO_CONN", "不得进入建连接阶段：{err}");
+    }
+
+    /// 执行入口同样在建立连接之前拦截写操作
+    #[tokio::test]
+    async fn execute_rejects_write_before_connecting() {
+        let db = temp_db();
+        let err = db
+            .execute("no-such-conn", "shop", "DELETE FROM orders", 5, "run-x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "1142", "应当在只读校验处被拦截：{err}");
     }
 }

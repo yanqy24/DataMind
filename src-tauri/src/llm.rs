@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::error::AppError;
 use crate::models::{ConnMemory, ModelConfig};
 
@@ -50,14 +52,18 @@ pub struct GenerateReq<'a> {
     pub table: &'a str,
 }
 
-/// 通用对话调用：返回模型原始文本（Agent 各阶段复用）
+/// 通用对话调用：返回模型原始文本（Agent 各阶段复用）。
+///
+/// `cancel` 用于中断在途请求：用户点「停止」或生成总预算耗尽时，
+/// 立刻丢弃这个 HTTP 请求，而不是干等 120s 超时。
 pub async fn chat(
     model: &ModelConfig,
     system: &str,
     user: &str,
     temperature: f32,
+    cancel: &CancellationToken,
 ) -> Result<String, AppError> {
-    call_model(model, system, user, temperature).await
+    call_model(model, system, user, temperature, cancel).await
 }
 
 /// 从模型输出中提取 JSON 对象（容忍 ```json 围栏与前后废话）
@@ -81,9 +87,13 @@ pub fn json_from(content: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(bare).ok()
 }
 
-pub async fn generate_sql(model: &ModelConfig, req: GenerateReq<'_>) -> Result<(String, String), AppError> {
+pub async fn generate_sql(
+    model: &ModelConfig,
+    req: GenerateReq<'_>,
+    cancel: &CancellationToken,
+) -> Result<(String, String), AppError> {
     let (system, user) = build_messages(&req);
-    let content = call_model(model, &system, &user, 0.2).await?;
+    let content = call_model(model, &system, &user, 0.2, cancel).await?;
     parse_answer(&content)
 }
 
@@ -93,6 +103,7 @@ async fn call_model(
     system: &str,
     user: &str,
     temperature: f32,
+    cancel: &CancellationToken,
 ) -> Result<String, AppError> {
     let base = model.base_url.trim().trim_end_matches('/');
     let url = if base.ends_with("/chat/completions") {
@@ -111,19 +122,24 @@ async fn call_model(
     };
 
     let client = reqwest::Client::builder().timeout(TIMEOUT).build()?;
-    let resp = client
+    let sending = client
         .post(&url)
         .bearer_auth(&model.api_key)
         .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::new("LLM_HTTP", format!("模型请求失败：{e}")))?;
+        .send();
+    let resp = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(AppError::new("CANCELLED", "已取消生成")),
+        r = sending => r.map_err(|e| AppError::new("LLM_HTTP", format!("模型请求失败：{e}")))?,
+    };
 
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| AppError::new("LLM_HTTP", format!("读取响应失败：{e}")))?;
+    let reading = resp.text();
+    let text = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(AppError::new("CANCELLED", "已取消生成")),
+        r = reading => r.map_err(|e| AppError::new("LLM_HTTP", format!("读取响应失败：{e}")))?,
+    };
     if !status.is_success() {
         // 常见：401 Key 无效 / 429 限流 / 400 模型名错误
         return Err(AppError::new(

@@ -12,22 +12,11 @@ mod store;
 mod tunnel;
 mod watchdog;
 
-use std::sync::Arc;
-
 use tauri::Manager;
-
-use tokio::sync::Mutex;
-
-use store::Store;
 
 /// 供诊断工具（examples/）复用真实的解码逻辑
 #[doc(hidden)]
 pub use mysql::decode_diag;
-
-pub struct AppState {
-    pub store: Arc<Store>,
-    pub db: Mutex<mysql::DbManager>,
-}
 
 /// 应用数据目录（setup 时记录，供 panic 钩子等无 AppHandle 场景使用）
 pub static DATA_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();

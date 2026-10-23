@@ -69,6 +69,8 @@ export const state = reactive({
   sqlLog: [] as SqlLogItem[],
   /** 正在等待模型推理的 tabId 集合 */
   generating: {} as Record<string, boolean>,
+  /** tabId -> 本轮生成的 runId（用于「停止」） */
+  genRun: {} as Record<string, string>,
   /** 当前生成阶段（两阶段 Agent 流水线的进度提示） */
   genStage: { key: "", label: "" } as { key: string; label: string },
 });
@@ -379,6 +381,8 @@ export function closeTab(id: string) {
   if (i < 0) return;
   const t = state.tabs[i];
   if (t.running) void apiSql.cancel(`${id}:${t.running}`).catch(() => undefined);
+  // 关窗时同时停掉还在跑的生成任务，避免后台白烧模型调用
+  if (state.genRun[id]) void apiSql.cancel(state.genRun[id]).catch(() => undefined);
   state.tabs.splice(i, 1);
   if (state.activeTab === id) {
     state.activeTab = state.tabs[Math.max(0, i - 1)]?.id ?? null;
@@ -417,10 +421,13 @@ export async function generateSql(tab: QueryTab, prompt: string): Promise<void> 
     return;
   }
   tab.messages.push({ role: "user", text: prompt, ts: now() });
+  const runId = `gen:${tab.id}:${uid("r")}`;
+  state.genRun[tab.id] = runId;
   state.generating[tab.id] = true;
   try {
     state.genStage = { key: "schema", label: "分析表结构" };
     const r = await apiSql.generate({
+      runId,
       connId: tab.connId,
       db: tab.db,
       table: tab.table,
@@ -453,12 +460,29 @@ export async function generateSql(tab: QueryTab, prompt: string): Promise<void> 
     });
   } catch (e) {
     const err = beErr(e);
-    tab.messages.push({ role: "ai", text: `生成失败：${err.message}`, ts: now() });
-    toast(`生成失败：${err.message}`, "err");
+    if (err.code === "CANCELLED") {
+      tab.messages.push({ role: "ai", text: "已停止生成", ts: now() });
+      toast("已停止生成", "err");
+    } else {
+      tab.messages.push({ role: "ai", text: `生成失败：${err.message}`, ts: now() });
+      toast(`生成失败：${err.message}`, "err");
+    }
   } finally {
     delete state.generating[tab.id];
+    delete state.genRun[tab.id];
     state.genStage = { key: "", label: "" };
     saveUi();
+  }
+}
+
+/** 停止本窗口正在进行的 SQL 生成：模型请求与库内探查会立即中断 */
+export async function cancelGenerate(tab: QueryTab): Promise<void> {
+  const runId = state.genRun[tab.id];
+  if (!runId) return;
+  try {
+    await apiSql.cancel(runId);
+  } catch {
+    /* 任务可能已结束 */
   }
 }
 
@@ -468,9 +492,12 @@ export async function quickFixSql(tab: QueryTab, item: SqlItem): Promise<void> {
     toast("请先在右侧配置并启用一个模型", "err");
     return;
   }
+  const runId = `gen:${tab.id}:${uid("r")}`;
+  state.genRun[tab.id] = runId;
   state.generating[tab.id] = true;
   try {
     const r = await apiSql.generate({
+      runId,
       connId: tab.connId ?? "",
       db: tab.db,
       table: tab.table,
@@ -498,9 +525,11 @@ export async function quickFixSql(tab: QueryTab, item: SqlItem): Promise<void> {
     });
     toast("已生成修复后的 SQL", "ok");
   } catch (e) {
-    toast(`修复失败：${beErr(e).message}`, "err");
+    const err = beErr(e);
+    toast(err.code === "CANCELLED" ? "已停止生成" : `修复失败：${err.message}`, "err");
   } finally {
     delete state.generating[tab.id];
+    delete state.genRun[tab.id];
     saveUi();
   }
 }

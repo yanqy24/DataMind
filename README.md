@@ -4,12 +4,15 @@
 
 **与数据对话** — 自然语言查询数据库的桌面客户端
 
-用一句话描述你要的数据，DataMind 结合数据库结构记忆生成 SQL 并直接执行。
+用一句话描述你要的数据，DataMind 结合数据库结构记忆生成 SQL 并直接执行。  
 基于 Tauri 2 构建，单文件约 10 MB，数据不出本机。
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
+
 ![License](https://img.shields.io/badge/license-MIT-green)
+
 ![Rust](https://img.shields.io/badge/backend-Rust%20%2B%20Tauri%202-orange)
+
 ![Vue](https://img.shields.io/badge/frontend-Vue%203%20%2B%20TS-brightgreen)
 
 </div>
@@ -19,7 +22,7 @@
 ## 界面预览
 
 | 自然语言取数 | SQL 卡片与全文查看 | 快速模式 |
-| --- | --- | --- |
+| ------ | ----------- | ---- |
 | ![主界面](docs/screenshots/query-main.png) | ![SQL 卡片](docs/screenshots/sql-card.png) | ![快速模式](docs/screenshots/quick-mode.png) |
 
 ## 它是什么
@@ -64,15 +67,15 @@ DataMind 是一款面向「会用数据库但不想每次手写 SQL」人群的�
 
 ## 技术栈
 
-| 层 | 技术 | 说明 |
-| --- | --- | --- |
-| 壳 / 后端 | **Rust + Tauri 2** | 体积小（约 10 MB）、内存占用低，同一代码库可拓展 macOS / Linux / 移动端 |
-| 数据库驱动 | **mysql_async**（rustls） | 纯 Rust MySQL 驱动，连接池管理，无 OpenSSL 依赖 |
-| SSH 隧道 | **russh** | 纯 Rust SSH 协议栈，本地端口转发 |
-| SQL 守卫 | **sqlparser-rs** | AST 级只读保护与 SQL 校验 |
-| 编码修复 | **encoding_rs** | GBK / BIG5 / cp1252 解码与乱码还原 |
-| 模型协议 | **reqwest** + OpenAI 兼容 `/chat/completions` | 支持 DeepSeek、智谱及任意自定义端点 |
-| 前端 | **Vue 3 + TypeScript + Vite** | 组合式 API，无重型 UI 框架依赖 |
+| 层      | 技术                                          | 说明                                              |
+| ------ | ------------------------------------------- | ----------------------------------------------- |
+| 壳 / 后端 | **Rust + Tauri 2**                          | 体积小（约 10 MB）、内存占用低，同一代码库可拓展 macOS / Linux / 移动端 |
+| 数据库驱动  | **mysql_async**（rustls）                     | 纯 Rust MySQL 驱动，连接池管理，无 OpenSSL 依赖              |
+| SSH 隧道 | **russh**                                   | 纯 Rust SSH 协议栈，本地端口转发                           |
+| SQL 守卫 | **sqlparser-rs**                            | AST 级只读保护与 SQL 校验                               |
+| 编码修复   | **encoding_rs**                             | GBK / BIG5 / cp1252 解码与乱码还原                     |
+| 模型协议   | **reqwest** + OpenAI 兼容 `/chat/completions` | 支持 DeepSeek、智谱及任意自定义端点                          |
+| 前端     | **Vue 3 + TypeScript + Vite**               | 组合式 API，无重型 UI 框架依赖                             |
 
 ## 项目结构
 
@@ -108,7 +111,7 @@ DataMind 是一款面向「会用数据库但不想每次手写 SQL」人群的�
 
 ### 方式一：下载安装包（推荐）
 
-前往 [Releases](../../releases) 下载最新的 `DataMind_x64-setup.exe`（NSIS 安装包）或绿色版 `DataMind.exe`，双击运行即可。
+前往 [Releases](../../releases) 下载最新的 `DataMind_x64-setup.exe`（NSIS 安装包）或绿色版 `DataMind.exe`，双击运行即可。  
 需要 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)（Windows 11 / 更新过的 Win10 已内置，安装包亦可自动引导下载）。
 
 ### 方式二：源码构建
@@ -131,9 +134,9 @@ src-tauri/target/release/DataMind.exe          # 单文件可直接运行
 src-tauri/target/release/bundle/nsis/*.exe     # NSIS 安装包
 ```
 
-> **注意**：发行构建必须启用 `custom-protocol` feature（前端资源才会随 exe 内嵌）。
-> `npm run tauri:build` 会自动加上；若直接用 cargo 构建，请执行
-> `cargo build --release --features custom-protocol`（或 `npm run build:exe`），
+> **注意**：发行构建必须启用 `custom-protocol` feature（前端资源才会随 exe 内嵌）。  
+> `npm run tauri:build` 会自动加上；若直接用 cargo 构建，请执行  
+> `cargo build --release --features custom-protocol`（或 `npm run build:exe`），  
 > 否则 exe 会尝试加载开发服务器地址导致白屏。
 
 纯前端调试（不连数据库）：`npm run dev`。
@@ -149,7 +152,7 @@ src-tauri/target/release/bundle/nsis/*.exe     # NSIS 安装包
 
 ### 界面白屏 / 黑屏
 
-Windows 上 WebView2 的浏览器进程若被第三方模块注入并崩溃，宿主窗口仍在但页面无法渲染。
+Windows 上 WebView2 的浏览器进程若被第三方模块注入并崩溃，宿主窗口仍在但页面无法渲染。  
 DataMind 内置守护逻辑：检测到崩溃后自动重建窗口（最多 2 次），仍失败则弹出系统提示。
 
 已知冲突源：**部分第三方输入法（如搜狗输入法）以 TSF 方式注入 WebView2 进程，会在初始化阶段使其崩溃**。规避方式：

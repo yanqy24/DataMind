@@ -122,10 +122,28 @@ pub async fn sql_execute(
     db: String,
     sql: String,
     timeout_secs: u64,
+    // 服务端分页：1-based 页码 + 单页行数；两者都给才分页，否则原样执行
+    page: Option<u32>,
+    page_size: Option<u32>,
+    // 翻页时传 true：同一条 SQL 的重复执行不写入执行日志，避免刷屏
+    silent: Option<bool>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<QueryResult, AppError> {
-    let result = state.db.execute(&conn_id, &db, &sql, timeout_secs, &run_id).await;
+    let result = match (page, page_size) {
+        (Some(p), Some(ps)) => {
+            state
+                .db
+                .execute_paged(&conn_id, &db, &sql, timeout_secs, &run_id, p, ps)
+                .await
+        }
+        _ => state.db.execute(&conn_id, &db, &sql, timeout_secs, &run_id).await,
+    };
+
+    if silent == Some(true) {
+        let _ = app; // 预留事件推送
+        return result;
+    }
 
     // 记录执行日志（成功 / 失败 / 取消）
     let conn_name = state
@@ -168,7 +186,32 @@ pub async fn result_export(
     path: String,
     format: String,
     payload: crate::export::ExportPayload,
+    // 结果集为服务端分页时传入：后端按原始 SQL 重新查全量再导出（导出不受分页限制）
+    query: Option<crate::export::ExportQuery>,
+    state: State<'_, AppState>,
 ) -> Result<crate::export::ExportStat, AppError> {
+    let payload = match query {
+        Some(q) => {
+            let run_id = format!("export:{}", chrono::Utc::now().timestamp_millis());
+            let full = state
+                .db
+                .execute(&q.conn_id, &q.db, &q.sql, q.timeout_secs, &run_id)
+                .await?;
+            crate::export::ExportPayload {
+                columns: full
+                    .columns
+                    .into_iter()
+                    .map(|c| crate::export::ExportColumn {
+                        name: c.name,
+                        r#type: c.r#type,
+                    })
+                    .collect(),
+                rows: full.rows,
+                source: payload.source,
+            }
+        }
+        None => payload,
+    };
     crate::export::export_to(&path, &format, &payload)
 }
 

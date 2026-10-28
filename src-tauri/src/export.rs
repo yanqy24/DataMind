@@ -25,6 +25,22 @@ pub struct ExportColumn {
     pub r#type: String,
 }
 
+/// 结果集为服务端分页时，用原始查询重新取**全量**数据再导出（导出不受分页限制）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportQuery {
+    pub conn_id: String,
+    #[serde(default)]
+    pub db: String,
+    pub sql: String,
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_timeout() -> u64 {
+    60
+}
+
 /// 结果来源（连接 / 库 / SQL），写入导出文件便于溯源
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]

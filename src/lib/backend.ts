@@ -50,6 +50,11 @@ export const apiSql = {
     db: string;
     sql: string;
     timeoutSecs: number;
+    /** 服务端分页：1-based 页码 + 单页行数（两者都给才分页） */
+    page?: number;
+    pageSize?: number;
+    /** true = 翻页重查，不写入执行日志 */
+    silent?: boolean;
   }) => invoke<QueryResult>("sql_execute", p),
   cancel: (runId: string) => invoke<void>("sql_cancel", { runId }),
   /** 模型推理生成 SQL；mode=fix 为错误修复（runId 供取消用） */
@@ -80,6 +85,8 @@ export const apiExport = {
       rows: (string | null)[][];
       source?: { conn: string; db: string; sql: string };
     };
+    /** 结果集为服务端分页时给出原始查询：后端重新查全量再导出，不受分页限制 */
+    query?: { connId: string; db: string; sql: string; timeoutSecs: number };
   }) =>
     invoke<{ path: string; format: string; rows: number; columns: number; bytes: number }>(
       "result_export",

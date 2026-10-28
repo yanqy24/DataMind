@@ -35,8 +35,10 @@ const SAMPLE_ROWS: usize = 2;
 const SAMPLE_ROWS_LIVE: usize = 20;
 /*
  * 历史说明：此前有过 `MAX_RESULT_ROWS = 5000` 的结果集硬截断，已按需求移除。
- * 现在结果集完整返回前端，行数不再受限（渲染侧由分页控制每页 1000 行）。
+ * 现在由**服务端分页**控制：一次只取一页回客户端，单页行数上限 1000。
  */
+/// 单页行数硬上限（防御性：即使前端传更大的值也按此截断，避免一次拉回过多行）
+pub const MAX_PAGE_SIZE: u32 = 1000;
 
 const SYSTEM_DATABASES: &[&str] = &["information_schema", "mysql", "performance_schema", "sys"];
 
@@ -515,6 +517,60 @@ impl DbManager {
         }
         self.end_run(run_id);
         Err(last.unwrap_or_else(|| AppError::new("MYSQL", "执行失败")))
+    }
+
+    /// 服务端分页执行：只取第 `page` 页的 `page_size` 行回客户端。
+    ///
+    /// - 用户 SQL 自带 LIMIT / OFFSET 时**不改写**，原样执行（界面也不分页）；
+    /// - 否则追加 `LIMIT page_size OFFSET (page-1)*page_size`，并额外统计一次总行数用于展示页码；
+    ///   统计失败不影响翻页（此时 `total` 为 None，界面降级为「上一页 / 下一页」）。
+    pub async fn execute_paged(
+        &self,
+        conn_id: &str,
+        db: &str,
+        sql: &str,
+        timeout_secs: u64,
+        run_id: &str,
+        page: u32,
+        page_size: u32,
+    ) -> Result<QueryResult, AppError> {
+        guard::ensure_select_only(sql)?;
+        let page_size = page_size.clamp(1, MAX_PAGE_SIZE);
+        let page = page.max(1);
+        let paged = guard::append_paging(sql, page, page_size);
+        let run_sql = paged.as_deref().unwrap_or(sql);
+        let mut res = self.execute(conn_id, db, run_sql, timeout_secs, run_id).await?;
+
+        let total = if paged.is_some() {
+            match guard::count_wrap(sql) {
+                Some(count_sql) => {
+                    // 独立 run_id：统计查询不占用主查询的取消令牌
+                    let count_run = format!("{run_id}:count");
+                    match self
+                        .execute(conn_id, db, &count_sql, timeout_secs, &count_run)
+                        .await
+                    {
+                        Ok(r) => r
+                            .rows
+                            .first()
+                            .and_then(|row| row.first().cloned().flatten())
+                            .and_then(|v| v.trim().parse::<u64>().ok()),
+                        Err(e) => {
+                            trace_conn(&format!("PAGE_COUNT_FAILED err={}", e.message));
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            Some(res.rows.len() as u64)
+        };
+
+        res.total = total;
+        res.page = page;
+        res.page_size = page_size;
+        Ok(res)
     }
 
     /// 单次执行（不含重连重试）
@@ -1159,6 +1215,9 @@ fn convert_rows(rows: Vec<Row>, ms: u64) -> QueryResult {
         columns,
         rows: data,
         ms,
+        total: None,
+        page: 1,
+        page_size: 0,
     }
 }
 

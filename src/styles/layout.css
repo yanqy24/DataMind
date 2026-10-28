@@ -263,6 +263,8 @@
 /* 表格 + 分页条：分页条固定在底部，不随表格横向滚动 */
 .grid-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .grid-wrap { flex: 1; overflow: auto; min-height: 0; background: var(--surface); }
+/* 翻页查询中：保留上一页内容，置灰示意 */
+.grid-wrap.is-loading { opacity: .45; pointer-events: none; }
 .result-empty{ flex: 1; display: grid; place-items: center; color: var(--text-3); font-size: 12px; }
 
 /* 分页（右下角） */
@@ -276,6 +278,7 @@
   user-select: none;
 }
 .grid-pager__info { color: var(--text-3); font-variant-numeric: tabular-nums; }
+.grid-pager__loading { color: var(--accent); }
 .grid-pager__size{
   height: 22px; padding: 0 4px;
   border: 1px solid var(--border); border-radius: 4px;

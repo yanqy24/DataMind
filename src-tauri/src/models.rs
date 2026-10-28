@@ -179,9 +179,22 @@ pub struct SqlLogItem {
 #[serde(rename_all = "camelCase")]
 pub struct QueryResult {
     pub columns: Vec<QueryColumn>,
-    /// 行 -> 单元格（NULL 为 null）。完整结果集，不做行数截断。
+    /// 行 -> 单元格（NULL 为 null）。服务端分页时**只包含当前页**的行。
     pub rows: Vec<Vec<Option<String>>>,
     pub ms: u64,
+    /// 服务端分页：满足条件的总行数；无法统计（用户自带 LIMIT / WITH 语句 / 统计失败）时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// 当前页码（1-based）
+    #[serde(default = "one")]
+    pub page: u32,
+    /// 单页行数（0 = 未分页）
+    #[serde(default)]
+    pub page_size: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize)]

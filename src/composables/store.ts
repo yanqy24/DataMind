@@ -574,7 +574,21 @@ export function addManualSql(tab: QueryTab, sql: string): SqlItem {
   return tab.sqls[tab.sqls.length - 1];
 }
 
-export async function runSql(tab: QueryTab, item: SqlItem): Promise<void> {
+/** 单页行数默认 / 上限（与后端 MAX_PAGE_SIZE 一致） */
+export const DEFAULT_PAGE_SIZE = 1000;
+export const PAGE_SIZE_OPTIONS = [100, 200, 500, 1000] as const;
+
+/**
+ * 执行 SQL（**服务端分页**）：默认只取第 1 页（单页上限 1000 行），
+ * 翻页时按新页码重新执行同一条 SQL，而不是把完整结果集拉回来前端切分。
+ * @param paging 目标页码与单页行数；不传则用窗口当前的设置（默认第 1 页 / 1000 行）
+ * @param silent true = 翻页重查，不写入执行日志、不弹完成提示
+ */
+export async function runSql(
+  tab: QueryTab,
+  item: SqlItem,
+  paging?: { page?: number; pageSize?: number; silent?: boolean },
+): Promise<void> {
   if (!tab.connId || !tab.db) {
     toast("请先选择连接与数据库", "err");
     return;
@@ -583,7 +597,11 @@ export async function runSql(tab: QueryTab, item: SqlItem): Promise<void> {
     toast("当前窗口已有查询在执行", "err");
     return;
   }
-  const runId = `${tab.id}:${item.id}`;
+  const pageSize = paging?.pageSize ?? tab.paging?.pageSize ?? DEFAULT_PAGE_SIZE;
+  const page = paging?.page ?? 1;
+  // 翻页时 runId 带上页码，避免与上一页的取消令牌撞车
+  const runId = `${tab.id}:${item.id}` + (page > 1 ? `:p${page}` : "");
+  currentRunId.set(tab.id, runId);
   item.status = "running";
   item.error = null;
   item.ms = null;
@@ -597,12 +615,24 @@ export async function runSql(tab: QueryTab, item: SqlItem): Promise<void> {
       db: tab.db,
       sql: item.sql,
       timeoutSecs: state.settings.sqlTimeout,
+      page,
+      pageSize,
+      silent: paging?.silent === true,
     });
     item.status = "success";
     item.ms = result.ms;
-    item.rows = result.rows.length;
+    // 分页时卡片显示总行数（本页行数在结果栏展示），未分页时两者相同
+    item.rows = result.total ?? result.rows.length;
     tab.result = result as QueryResult;
-    toast(`查询完成 · ${result.rows.length} 条`, "ok");
+    // 用户自带 LIMIT 时后端不分页（total 为实际行数、pageSize 为 0），界面也不分页
+    const paged = (result.pageSize ?? 0) > 0;
+    tab.paging = paged
+      ? { page: result.page ?? page, pageSize: result.pageSize ?? pageSize, total: result.total ?? null }
+      : null;
+    if (paging?.silent !== true) {
+      const totalTxt = result.total != null ? ` / 共 ${result.total.toLocaleString("en-US")} 条` : "";
+      toast(`查询完成 · 本页 ${result.rows.length} 条${totalTxt}`, "ok");
+    }
   } catch (e) {
     const err = beErr(e);
     const ms = Date.now() - start;
@@ -622,8 +652,22 @@ export async function runSql(tab: QueryTab, item: SqlItem): Promise<void> {
   }
 }
 
+/**
+ * 翻页 / 改单页行数：用同一条 SQL 重新执行「目标页」的查询（服务端分页）。
+ * 结果栏会短暂进入「查询中」状态（复用 runSql 的超时与取消机制）。
+ */
+export async function gotoResultPage(tab: QueryTab, page: number, pageSize?: number): Promise<void> {
+  const item = [...tab.sqls].reverse().find((s) => s.status === "success");
+  if (!item) return;
+  const size = pageSize ?? tab.paging?.pageSize ?? DEFAULT_PAGE_SIZE;
+  await runSql(tab, item, { page, pageSize: size, silent: page > 1 || size !== tab.paging?.pageSize });
+}
+
+/** 窗口当前查询的 run_id（翻页时 run_id 带页码后缀，取消必须用它才能命中） */
+const currentRunId = new Map<string, string>();
+
 export async function cancelSql(tab: QueryTab, item: SqlItem): Promise<void> {
-  const runId = `${tab.id}:${item.id}`;
+  const runId = currentRunId.get(tab.id) ?? `${tab.id}:${item.id}`;
   try {
     await apiSql.cancel(runId);
   } catch {
@@ -650,9 +694,6 @@ export async function clearSqls(tab: QueryTab): Promise<void> {
 }
 
 /* ---------- 结果导出 ---------- */
-
-/** 超过该行数时导出提示里额外给出行数（大结果集写盘需要一点时间） */
-const EXPORT_CONFIRM_ROWS = 5000;
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -702,16 +743,23 @@ export async function exportResult(tab: QueryTab, kind: "xlsx" | "json"): Promis
   }
   if (!path) return; // 用户取消
 
-  // 导出始终作用于完整结果集，与界面分页无关（分页只影响渲染）
-  if (r.rows.length >= EXPORT_CONFIRM_ROWS) {
-    toast(`正在导出全部 ${r.rows.length} 行（不受分页影响，行数较多请稍候）…`);
-  } else {
-    toast(`正在导出 ${r.rows.length} 行…`);
-  }
-
+  // 结果集为服务端分页时，把原始 SQL 交给后端**重新查全量**再导出（导出不受分页限制）
   const src = [...tab.sqls].reverse().find((s) => s.status === "success");
+  const paged = !!tab.paging && !!src && !!tab.connId;
+  const query = paged
+    ? { connId: tab.connId as string, db: tab.db, sql: src!.sql, timeoutSecs: state.settings.sqlTimeout }
+    : undefined;
+  const exportRows = tab.paging?.total ?? r.rows.length;
+  toast(
+    query
+      ? `正在按原始 SQL 重新查询并导出全部 ${exportRows.toLocaleString("en-US")} 行（不受分页影响，请稍候）…`
+      : `正在导出 ${r.rows.length} 行…`,
+  );
+
   try {
     const stat = await apiExport.toFile({
+      // query 存在时后端以重查结果为准，payload.rows 仅作兜底
+      query,
       path,
       format: kind,
       payload: {

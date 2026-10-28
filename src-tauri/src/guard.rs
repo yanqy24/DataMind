@@ -73,13 +73,59 @@ fn check_set_expr(e: &SetExpr) -> Result<(), AppError> {
 
 /*
  * 历史说明：此处曾为无 LIMIT 的 SELECT 自动追加 `LIMIT 5001`，并在结果侧做 5000 行硬截断。
- * 该行为已按需求移除 —— SQL 原样下发、结果集完整返回，大结果集由前端分页按需渲染
- * （见 ResultGrid.vue）。若将来需要保护，应在**设置项**中显式开启，而不是默认改写用户 SQL。
+ * 该行为已按需求移除 —— 改为**服务端分页**：执行时按页追加 `LIMIT n OFFSET m`，
+ * 一次只取一页（默认 1000 行）回客户端，翻页时再查下一页，而不是把整表拉回来前端切分。
  */
+
+/// 顶层是否已带 LIMIT / OFFSET（AST 精确判断，不会误判子查询里的 LIMIT）
+pub fn has_row_limit(sql: &str) -> bool {
+    match Parser::parse_sql(&MySqlDialect {}, sql) {
+        Ok(stmts) => matches!(
+            stmts.first(),
+            Some(Statement::Query(q)) if q.limit.is_some() || q.offset.is_some()
+        ),
+        Err(_) => false,
+    }
+}
+
+/// 服务端分页：为**无 LIMIT** 的 SELECT 追加 `LIMIT n OFFSET m`。
+///
+/// 返回 `None` 表示用户 SQL 已自带 LIMIT / OFFSET —— 那是用户显式指定的行数，
+/// 保持原样执行，不覆盖其意图（此时界面也不分页）。
+pub fn append_paging(sql: &str, page: u32, page_size: u32) -> Option<String> {
+    if has_row_limit(sql) {
+        return None;
+    }
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let page = page.max(1);
+    let page_size = page_size.max(1);
+    let offset = (page as u64 - 1) * page_size as u64;
+    // 换行后再拼接：即便 SQL 末尾是 `-- 行注释` 也不会把 LIMIT 吞进注释里
+    Some(if offset == 0 {
+        format!("{trimmed}\nLIMIT {page_size}")
+    } else {
+        format!("{trimmed}\nLIMIT {page_size} OFFSET {offset}")
+    })
+}
+
+/// 统计总行数用的包装 SQL（`SELECT COUNT(*) FROM (原 SQL) AS t`）。
+/// `WITH ...` 语句无法安全包进派生表，返回 `None`（此时界面降级为「上一页 / 下一页」）。
+pub fn count_wrap(sql: &str) -> Option<String> {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    if trimmed.is_empty() || trimmed.to_ascii_lowercase().starts_with("with") {
+        return None;
+    }
+    Some(format!(
+        "SELECT COUNT(*) AS `_dm_total` FROM (\n{trimmed}\n) AS `_dm_src`"
+    ))
+}
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_select_only;
+    use super::{append_paging, count_wrap, ensure_select_only};
 
     /// 不限制结果集：校验只判断「是否只读」，既不改写语句也不要求必须带 LIMIT
     #[test]
@@ -87,6 +133,44 @@ mod tests {
         assert!(ensure_select_only("SELECT * FROM orders").is_ok());
         assert!(ensure_select_only("SELECT * FROM orders LIMIT 10").is_ok());
         assert!(ensure_select_only("WITH x AS (SELECT 1) SELECT * FROM x").is_ok());
+    }
+
+    /// 服务端分页：无 LIMIT 的 SQL 追加 LIMIT/OFFSET，已带 LIMIT 的保持原样
+    #[test]
+    fn paging_appended_only_when_no_limit() {
+        assert_eq!(
+            append_paging("SELECT * FROM orders", 1, 1000).unwrap(),
+            "SELECT * FROM orders\nLIMIT 1000"
+        );
+        assert_eq!(
+            append_paging("SELECT * FROM orders", 3, 1000).unwrap(),
+            "SELECT * FROM orders\nLIMIT 1000 OFFSET 2000"
+        );
+        // 用户自带 LIMIT / OFFSET：保持原样，不覆盖用户意图
+        assert_eq!(append_paging("SELECT * FROM orders LIMIT 50", 1, 1000), None);
+        assert_eq!(append_paging("SELECT * FROM orders LIMIT 50 OFFSET 10", 1, 1000), None);
+        // 子查询里的 LIMIT 不算顶层限制，仍应分页
+        assert!(append_paging(
+            "SELECT id, (SELECT x FROM t2 LIMIT 1) AS y FROM t1",
+            2,
+            500
+        )
+        .unwrap()
+        .ends_with("LIMIT 500 OFFSET 500"));
+        // UNION 语句：LIMIT 作用于整体
+        assert!(append_paging("SELECT a FROM t1 UNION SELECT a FROM t2", 2, 200)
+            .unwrap()
+            .contains("LIMIT 200 OFFSET 200"));
+        // 第 0 页按第 1 页处理
+        assert!(append_paging("SELECT 1", 0, 100).unwrap().ends_with("LIMIT 100"));
+    }
+
+    /// 总数统计包装：WITH 语句不做包装（界面降级为上一页/下一页）
+    #[test]
+    fn count_wrap_skips_cte() {
+        assert!(count_wrap("SELECT * FROM t").unwrap().starts_with("SELECT COUNT(*)"));
+        assert!(count_wrap("SELECT * FROM t;").unwrap().contains("AS `_dm_src`"));
+        assert_eq!(count_wrap("WITH x AS (SELECT 1) SELECT * FROM x"), None);
     }
 
     /// 移除 LIMIT 逻辑不能以放松只读约束为代价

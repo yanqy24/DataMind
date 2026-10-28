@@ -113,9 +113,23 @@ export interface ModelConfig {
 /** SQL 执行结果集 */
 export interface QueryResult {
   columns: { name: string; type: string }[];
-  /** 行 -> 单元格值（已转字符串，NULL 为 null）。完整结果集，不做行数截断 */
+  /** 行 -> 单元格值（已转字符串，NULL 为 null）。服务端分页时只包含**当前页**的行 */
   rows: (string | null)[][];
   ms: number;
+  /** 服务端分页：满足条件的总行数；无法统计时为 null */
+  total?: number | null;
+  /** 当前页码（1-based） */
+  page?: number;
+  /** 单页行数（0 = 未分页） */
+  pageSize?: number;
+}
+
+/** 服务端分页状态（挂在查询窗口上，翻页时按它重新执行 SQL） */
+export interface ResultPaging {
+  page: number;
+  pageSize: number;
+  /** 总行数；无法统计时为 null（界面降级为「上一页 / 下一页」） */
+  total: number | null;
 }
 
 /** SQL 卡片状态 */
@@ -183,6 +197,8 @@ export interface QueryTab {
   messages: ChatMessage[];
   sqls: SqlItem[];
   result: QueryResult | null;
+  /** 结果集的服务端分页状态（仅在当前结果是分页查询时有值） */
+  paging?: ResultPaging | null;
   running: string | null;
 }
 

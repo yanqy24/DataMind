@@ -19,6 +19,7 @@ import {
   touchTab,
   uid,
   exportResult,
+  gotoResultPage,
 } from "../composables/store";
 import { openMemory, openSqlEditor, openNewSql } from "../composables/modals";
 import { copyText, icon, toast, confirmDialog } from "../composables/ui";
@@ -103,6 +104,15 @@ function newSql() {
   // 已选中数据表时预填一条可直接改的骨架，未选表则留空让用户自由粘贴
   const t = tab.value.table.replace(/`/g, "");
   openNewSql(tab.value.id, t ? `SELECT * FROM \`${t}\`` : "");
+}
+
+/* ---------- 服务端分页 ---------- */
+/** 翻页：用同一条 SQL 重新执行目标页查询（不是前端切分） */
+function onGotoPage(p: number) {
+  void gotoResultPage(tab.value, p);
+}
+function onPageSize(n: number) {
+  void gotoResultPage(tab.value, 1, n);
 }
 
 /* ---------- 结果导出 ---------- */
@@ -240,6 +250,8 @@ const lastOk = computed(() => {
   const ok = tab.value.sqls.filter((s) => s.status === "success");
   return ok.length ? ok[ok.length - 1] : null;
 });
+
+const fmtNum = (n: number): string => n.toLocaleString("en-US");
 
 function copyAll() {
   const r = tab.value.result;
@@ -473,7 +485,8 @@ function persistSizes() {
             </template>
             <template v-else-if="tab.result">
               <span class="tag tag--ok">完成</span>
-              <span>共 <b>{{ tab.result.rows.length }}</b> 条
+              <span>本页 <b>{{ tab.result.rows.length }}</b> 条<template
+                  v-if="tab.paging?.total != null"> · 共 {{ fmtNum(tab.paging.total) }} 条</template>
                 <template v-if="lastOk?.ms != null"> · {{ lastOk.ms }} ms</template>
               </span>
             </template>
@@ -484,8 +497,12 @@ function persistSizes() {
               <span v-html="icon('stop', 12)"></span> 取消查询
             </button>
             <template v-else-if="tab.result">
-              <button class="btn btn--sm" @click="copyAll"><span v-html="icon('copy', 12)"></span> 复制全部</button>
-              <button class="btn btn--sm" @click="copyMd"><span v-html="icon('copy', 12)"></span> 复制为 Markdown</button>
+              <button class="btn btn--sm" @click="copyAll" :title="tab.paging ? '结果集为服务端分页，仅复制当前页' : ''">
+                <span v-html="icon('copy', 12)"></span> {{ tab.paging ? "复制本页" : "复制全部" }}
+              </button>
+              <button class="btn btn--sm" @click="copyMd">
+                <span v-html="icon('copy', 12)"></span> {{ tab.paging ? "复制本页 Markdown" : "复制为 Markdown" }}
+              </button>
               <button class="btn btn--sm" :disabled="!!exporting" @click="doExport('xlsx')"
                 title="导出全部结果行（不受分页影响）">
                 <span v-html="icon('down', 12)"></span> {{ exporting === "xlsx" ? "导出中…" : "导出 Excel" }}
@@ -497,7 +514,8 @@ function persistSizes() {
             </template>
           </div>
         </div>
-        <ResultGrid :result="tab.result" />
+        <ResultGrid :result="tab.result" :paging="tab.paging ?? null" :loading="!!tab.running"
+          @goto="onGotoPage" @size="onPageSize" />
       </div>
     </div>
   </div>

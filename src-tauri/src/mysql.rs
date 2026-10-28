@@ -568,8 +568,9 @@ impl DbManager {
         };
 
         res.total = total;
-        res.page = page;
-        res.page_size = page_size;
+        // page_size = 0 表示「本次未分页」（用户 SQL 自带的 LIMIT 一页放得下）—— 界面据此隐藏分页条
+        res.page = if paged.is_some() { page } else { 1 };
+        res.page_size = if paged.is_some() { page_size } else { 0 };
         Ok(res)
     }
 

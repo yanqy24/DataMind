@@ -77,17 +77,6 @@ fn check_set_expr(e: &SetExpr) -> Result<(), AppError> {
  * 一次只取一页（默认 1000 行）回客户端，翻页时再查下一页，而不是把整表拉回来前端切分。
  */
 
-/// 顶层是否已带 LIMIT / OFFSET（AST 精确判断，不会误判子查询里的 LIMIT）
-pub fn has_row_limit(sql: &str) -> bool {
-    match Parser::parse_sql(&MySqlDialect {}, sql) {
-        Ok(stmts) => matches!(
-            stmts.first(),
-            Some(Statement::Query(q)) if q.limit.is_some() || q.offset.is_some()
-        ),
-        Err(_) => false,
-    }
-}
-
 /// 服务端分页：把 SQL 改写成「只取第 `page` 页」的形式，返回 `None` 表示不需要改写。
 ///
 /// - 无顶层 LIMIT：末尾追加 `LIMIT n OFFSET m`（一次只取一页）。

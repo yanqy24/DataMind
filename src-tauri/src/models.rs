@@ -186,15 +186,9 @@ pub struct QueryResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u64>,
     /// 当前页码（1-based）
-    #[serde(default = "one")]
     pub page: u32,
     /// 单页行数（0 = 未分页）
-    #[serde(default)]
     pub page_size: u32,
-}
-
-fn one() -> u32 {
-    1
 }
 
 #[derive(Debug, Clone, Serialize)]

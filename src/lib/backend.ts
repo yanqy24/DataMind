@@ -12,6 +12,7 @@ import type {
   QueryResult,
   SqlLogItem,
   TableDetail,
+  ChatTurn,
 } from "../types";
 
 /** 后端抛错时 invoke 会 reject 出该结构 */
@@ -62,8 +63,28 @@ export const apiSql = {
     prevSql: string | null;
     error: string | null;
     agent?: boolean;
+    /** 多轮上下文：本窗口历史对话（首轮为空数组） */
+    history?: ChatTurn[];
   }) =>
     invoke<{ sql: string; note: string; steps: AgentStep[] }>("sql_generate", p),
+};
+
+/* ---------- 结果导出 ---------- */
+export const apiExport = {
+  /** 按 path + format 导出当前结果集（路径由「另存为」对话框给出） */
+  toFile: (p: {
+    path: string;
+    format: "xlsx" | "json";
+    payload: {
+      columns: { name: string; type: string }[];
+      rows: (string | null)[][];
+      source?: { conn: string; db: string; sql: string };
+    };
+  }) =>
+    invoke<{ path: string; format: string; rows: number; columns: number; bytes: number }>(
+      "result_export",
+      p,
+    ),
 };
 
 /* ---------- 模型 ---------- */

@@ -148,6 +148,17 @@ impl Default for AppSettings {
     }
 }
 
+/* ---------- 多轮上下文 ---------- */
+
+/// 对话中的一轮（前端 tab.messages 的精简投影），用于多轮生成时带上历史语境
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatTurn {
+    /// user | ai
+    pub role: String,
+    pub text: String,
+}
+
 /* ---------- SQL 日志 ---------- */
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

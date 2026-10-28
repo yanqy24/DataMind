@@ -18,8 +18,9 @@ import {
   syncConnection,
   touchTab,
   uid,
+  exportResult,
 } from "../composables/store";
-import { openMemory, openSqlEditor } from "../composables/modals";
+import { openMemory, openSqlEditor, openNewSql } from "../composables/modals";
 import { copyText, icon, toast, confirmDialog } from "../composables/ui";
 import { formatSQL, highlightSQL } from "../lib/sql";
 import Splitter from "./Splitter.vue";
@@ -92,6 +93,29 @@ function stopGenerate() {
   void cancelGenerate(tab.value);
 }
 const modelLabel = computed(() => activeModel.value?.name ?? "未选择模型");
+
+/* ---------- 多轮上下文 ---------- */
+/** 已有对话 + 已有 SQL：下一次生成会带上历史对话与上一轮 SQL 迭代，而非从零生成 */
+const followUp = computed(() => tab.value.messages.length > 0 && tab.value.sqls.length > 0);
+
+/* ---------- 手写 SQL ---------- */
+function newSql() {
+  // 已选中数据表时预填一条可直接改的骨架，未选表则留空让用户自由粘贴
+  const t = tab.value.table.replace(/`/g, "");
+  openNewSql(tab.value.id, t ? `SELECT * FROM \`${t}\` LIMIT 100` : "");
+}
+
+/* ---------- 结果导出 ---------- */
+const exporting = ref<"" | "xlsx" | "json">("");
+async function doExport(kind: "xlsx" | "json") {
+  if (exporting.value) return;
+  exporting.value = kind;
+  try {
+    await exportResult(tab.value, kind);
+  } finally {
+    exporting.value = "";
+  }
+}
 
 /* ---------- 两阶段生成：阶段进度 ---------- */
 const AGENT_STAGES = [
@@ -333,10 +357,15 @@ function persistSizes() {
           </div>
           <div class="composer">
             <div class="composer__box">
-              <textarea v-model="composerText" placeholder="用自然语言描述你要查询的数据，例如：统计上个月各城市的订单数和销售额，按销售额倒序"
+              <textarea v-model="composerText"
+                :placeholder="followUp
+                  ? '结果不对？继续补充说明，例如：只要已支付的订单、按城市分组、改成按周统计'
+                  : '用自然语言描述你要查询的数据，例如：统计上个月各城市的订单数和销售额，按销售额倒序'"
                 @keydown.enter.ctrl.prevent="send" @keydown.enter.meta.prevent="send"></textarea>
               <div class="composer__bar">
-                <span class="composer__hint">Ctrl + Enter 发送 · 仅生成 SELECT</span>
+                <span class="composer__hint">
+                  {{ followUp ? "本轮将结合历史对话与上一轮 SQL 迭代生成 · " : "" }}Ctrl + Enter 发送 · 仅生成 SELECT
+                </span>
                 <span class="tag tag--ghost" v-html="icon('spark', 11) + ' ' + modelLabel"></span>
                 <div style="flex:1"></div>
                 <button v-if="generating" class="btn btn--ghost btn--sm" @click="stopGenerate">
@@ -358,6 +387,10 @@ function persistSizes() {
           <div class="sql-head">
             <span v-html="icon('spark', 12) + ' 生成的 SQL'"></span>
             <span class="tag tag--ghost" style="margin-left:auto">{{ tab.sqls.length }}</span>
+            <button class="btn btn--sm sql-head__new" title="手写或粘贴一条 SELECT 后执行"
+              @click="newSql">
+              <span v-html="icon('plus', 12)"></span> 新建 SQL
+            </button>
             <button v-if="tab.sqls.length" class="iconbtn iconbtn--sm sql-head__clear" title="清空全部 SQL"
               @click="doClear" v-html="icon('trash', 13)"></button>
           </div>
@@ -369,7 +402,7 @@ function persistSizes() {
               <div class="sqlcard__main" @mouseenter="showTip(item)" @mousemove="moveTip" @mouseleave="hideTip"
                 @click="hideTip(); openEditor(item)">
                 <div class="sqlcard__head">
-                  <span>#{{ idx + 1 }}{{ item.fixed ? " · 修复" : "" }}</span>
+                  <span>#{{ idx + 1 }}{{ item.fixed ? " · 修复" : "" }}{{ item.manual ? " · 手写" : "" }}</span>
                   <span>{{ item.ts }}</span>
                   <span :class="statusTag(item).cls">{{ statusTag(item).label }}</span>
                   <span v-if="item.ms != null" class="tag tag--ghost">{{ item.ms }} ms</span>
@@ -454,6 +487,12 @@ function persistSizes() {
             <template v-else-if="tab.result">
               <button class="btn btn--sm" @click="copyAll"><span v-html="icon('copy', 12)"></span> 复制全部</button>
               <button class="btn btn--sm" @click="copyMd"><span v-html="icon('copy', 12)"></span> 复制为 Markdown</button>
+              <button class="btn btn--sm" :disabled="!!exporting" @click="doExport('xlsx')">
+                <span v-html="icon('down', 12)"></span> {{ exporting === "xlsx" ? "导出中…" : "导出 Excel" }}
+              </button>
+              <button class="btn btn--sm" :disabled="!!exporting" @click="doExport('json')">
+                <span v-html="icon('down', 12)"></span> {{ exporting === "json" ? "导出中…" : "导出 JSON" }}
+              </button>
             </template>
           </div>
         </div>

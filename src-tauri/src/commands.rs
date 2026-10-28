@@ -159,6 +159,19 @@ pub async fn sql_cancel(run_id: String, state: State<'_, AppState>) -> Result<bo
     Ok(state.db.cancel(&run_id))
 }
 
+/* ---------- 结果集导出 ---------- */
+
+/// 把当前结果集导出为 Excel（xlsx）或 JSON。
+/// 路径由前端的「另存为」对话框给出，内容与界面展示一致（列名 / 类型 / 全部行）。
+#[tauri::command]
+pub async fn result_export(
+    path: String,
+    format: String,
+    payload: crate::export::ExportPayload,
+) -> Result<crate::export::ExportStat, AppError> {
+    crate::export::export_to(&path, &format, &payload)
+}
+
 /* ---------- SQL 生成（模型推理） ---------- */
 
 #[tauri::command]
@@ -172,6 +185,8 @@ pub async fn sql_generate(
     prev_sql: Option<String>,
     error: Option<String>,
     agent: Option<bool>,
+    // history：多轮上下文，本窗口的历史对话（越靠后越新），首轮为空
+    history: Option<Vec<crate::models::ChatTurn>>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<GenerateAnswer, AppError> {
@@ -191,7 +206,11 @@ pub async fn sql_generate(
         ));
     }
 
-    // 3. 推理：两阶段 Agent 模式（分析 → 探查 → 设计 → 生成 → 校验）
+    // 3. 多轮上下文：把历史对话渲染成可嵌入 prompt 的文本（首轮为空字符串）
+    let history_text = llm::render_history(&history.unwrap_or_default());
+    let prev = prev_sql.clone().unwrap_or_default();
+
+    // 4. 推理：两阶段 Agent 模式（分析 → 探查 → 设计 → 生成 → 校验）
     //
     // 整条链路可被 sql_cancel 的 run_id 中断，并受 GENERATE_BUDGET 总预算约束；
     // 生成期间**不再独占数据库锁**，用户仍可正常查询 / 取消（见 AppState::db）。
@@ -228,6 +247,8 @@ pub async fn sql_generate(
                 table: &table,
                 conn_id: &conn_id,
                 memory: memory.as_ref(),
+                history: &history_text,
+                prev_sql: &prev,
             };
             match crate::agent::run(&model_cfg, &db_mgr, ctx, &emit, &token).await {
                 Ok(ans) => {
@@ -254,11 +275,12 @@ pub async fn sql_generate(
                     let req = llm::GenerateReq {
                         prompt: &prompt,
                         mode: &mode,
-                        prev_sql: prev_sql.as_deref().unwrap_or(""),
+                        prev_sql: &prev,
                         error: error.as_deref().unwrap_or(""),
                         memory: memory.as_ref(),
                         db: &db,
                         table: &table,
+                        history: &history_text,
                     };
                     llm::generate_sql(&model_cfg, req, &token).await?
                 }
@@ -267,11 +289,12 @@ pub async fn sql_generate(
             let req = llm::GenerateReq {
                 prompt: &prompt,
                 mode: &mode,
-                prev_sql: prev_sql.as_deref().unwrap_or(""),
+                prev_sql: &prev,
                 error: error.as_deref().unwrap_or(""),
                 memory: memory.as_ref(),
                 db: &db,
                 table: &table,
+                history: &history_text,
             };
             llm::generate_sql(&model_cfg, req, &token).await?
         };
@@ -296,7 +319,7 @@ pub async fn sql_generate(
         }
     };
 
-    // 4. 只读保护：模型输出也必须通过 SELECT 校验
+    // 5. 只读保护：模型输出也必须通过 SELECT 校验
     if crate::guard::ensure_select_only(&sql).is_err() {
         // 尝试从输出中提取 SELECT 片段
         if let Some(fixed) = extract_select(&sql) {
@@ -310,7 +333,7 @@ pub async fn sql_generate(
         crate::guard::ensure_select_only(&sql)?;
     }
 
-    // 5. 记录生成日志
+    // 6. 记录生成日志
     let conn_name = state
         .store
         .load_connections()?

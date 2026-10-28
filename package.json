@@ -1,6 +1,6 @@
 {
   "name": "datamind",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "DataMind — 自然语言查询数据库的桌面客户端 (Tauri 2 + Vue 3 + Rust)",
   "license": "MIT",
@@ -17,6 +17,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",
     "@tauri-apps/plugin-clipboard-manager": "^2.2.0",
+    "@tauri-apps/plugin-dialog": "^2.8.3",
     "sql-formatter": "^15.4.0",
     "vue": "^3.5.13"
   },

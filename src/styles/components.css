@@ -243,6 +243,8 @@
 .sqlcard__del:hover { color: var(--err); }
 .sql-head__clear { color: var(--text-3); }
 .sql-head__clear:hover { color: var(--err); }
+/* 「新建 SQL」按钮：在 34px 高的头部里保持紧凑 */
+.sql-head__new { height: 22px; padding: 0 8px; gap: 4px; font-size: 11px; }
 
 /* ---------- 两阶段生成：进度与推理过程 ---------- */
 .sqlcard-wrap { flex: none; display: flex; flex-direction: column; gap: 4px; }

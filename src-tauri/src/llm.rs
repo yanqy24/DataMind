@@ -50,6 +50,40 @@ pub struct GenerateReq<'a> {
     pub memory: Option<&'a ConnMemory>,
     pub db: &'a str,
     pub table: &'a str,
+    /// 已渲染好的历史对话文本（多轮上下文）：为空表示首轮
+    pub history: &'a str,
+}
+
+/* ---------- 多轮上下文 ---------- */
+
+/// 参与上下文的历史轮数上限（超过的更早对话对当前 SQL 影响很小，但很吃 token）
+const MAX_HISTORY_TURNS: usize = 10;
+/// 单条历史消息的最大字符数
+const MAX_HISTORY_CHARS: usize = 400;
+
+/// 把前端传来的对话轮次渲染成可嵌入 prompt 的文本（越新越靠后）
+pub fn render_history(turns: &[crate::models::ChatTurn]) -> String {
+    if turns.is_empty() {
+        return String::new();
+    }
+    let start = turns.len().saturating_sub(MAX_HISTORY_TURNS);
+    let mut out = String::new();
+    for t in &turns[start..] {
+        let role = if t.role == "user" { "用户" } else { "DataMind" };
+        out.push_str(&format!("{}：{}\n", role, clip_text(&t.text, MAX_HISTORY_CHARS)));
+    }
+    out.trim().to_string()
+}
+
+fn clip_text(s: &str, n: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= n {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(n).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// 通用对话调用：返回模型原始文本（Agent 各阶段复用）。
@@ -228,7 +262,15 @@ fn build_messages(req: &GenerateReq<'_>) -> (String, String) {
         }
     }
 
-    let user = if req.mode == "fix" {
+    // 多轮上下文：历史对话 + 上一轮 SQL，让模型在既有结果上迭代而非推倒重来
+    let mut user = String::new();
+    if !req.history.trim().is_empty() {
+        user.push_str("历史对话（用于理解语境，最终以本轮需求为准）：\n");
+        user.push_str(req.history.trim());
+        user.push_str("\n\n");
+    }
+
+    let body = if req.mode == "fix" {
         format!(
             "此前的 SQL 执行出错，请修复它，保持原意。\n原 SQL：\n{}\n错误信息：{}\n{}",
             req.prev_sql,
@@ -245,8 +287,19 @@ fn build_messages(req: &GenerateReq<'_>) -> (String, String) {
         } else {
             format!("用户当前选中的数据表是 {}，优先在该表查询，确需关联其他表时再联查。", req.table)
         };
-        format!("需求：{}\n{}", req.prompt, focus)
+        let prev = if req.prev_sql.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "上一轮生成的 SQL：\n{}\n\
+                 （本轮需求若是补充/修正：在其基础上增量修改，保留仍正确的部分；\
+                 若本轮明显换了问题：忽略它重新生成）\n",
+                req.prev_sql.trim()
+            )
+        };
+        format!("{}\n需求：{}\n{}", prev, req.prompt, focus)
     };
+    user.push_str(&body);
 
     (system, user)
 }
@@ -295,6 +348,31 @@ pub fn parse_answer(content: &str) -> Result<(String, String), AppError> {
         return Err(AppError::new("LLM_EMPTY", "模型未返回有效 SQL"));
     }
     Ok((sql, String::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_history_with_limit() {
+        assert!(render_history(&[]).is_empty());
+        let turns = vec![
+            crate::models::ChatTurn { role: "user".into(), text: "统计近 7 天订单数".into() },
+            crate::models::ChatTurn { role: "ai".into(), text: "已生成 SQL：SELECT COUNT(*) …".into() },
+        ];
+        let s = render_history(&turns);
+        assert!(s.contains("用户：统计近 7 天订单数"), "缺少用户轮：{s}");
+        assert!(s.contains("DataMind：已生成 SQL"), "缺少 AI 轮：{s}");
+
+        // 超长轮数只保留最近 MAX_HISTORY_TURNS 条
+        let many: Vec<_> = (0..MAX_HISTORY_TURNS + 5)
+            .map(|i| crate::models::ChatTurn { role: "user".into(), text: format!("第{i}轮") })
+            .collect();
+        let s = render_history(&many);
+        assert!(s.contains("第14轮"), "应保留最新轮次：{s}");
+        assert!(!s.contains("第0轮"), "更早的轮次应被丢弃：{s}");
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {

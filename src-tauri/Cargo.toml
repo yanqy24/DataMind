@@ -1,6 +1,6 @@
 [package]
 name = "datamind"
-version = "1.0.0"
+version = "1.1.0"
 description = "DataMind — 与数据对话的桌面客户端"
 authors = ["DataMind Contributors"]
 license = "MIT"
@@ -24,6 +24,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+
+# 结果集导出（Excel xlsx 写入，纯 Rust，无外部依赖）
+rust_xlsxwriter = "0.101"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

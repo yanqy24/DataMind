@@ -135,7 +135,7 @@ onMounted(() => {
       <div class="appbar__brand">
         <span class="logo" v-html="icon('layers', 18)"></span>
         <span class="appbar__name">DataMind</span>
-        <span class="tag tag--ghost">v1.0.0</span>
+        <span class="tag tag--ghost">v1.1.0</span>
       </div>
       <div class="appbar__actions">
         <div class="modeswitch" @mouseenter="modeTip = true" @mouseleave="modeTip = false">

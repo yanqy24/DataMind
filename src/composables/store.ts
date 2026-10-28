@@ -5,6 +5,7 @@ import { reactive, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppSettings,
+  ChatTurn,
   ConnConfig,
   ConnMemory,
   ModelConfig,
@@ -15,7 +16,7 @@ import type {
   DatabaseMeta,
   TableMeta,
 } from "../types";
-import { apiConn, apiModel, apiSettings, apiSql, apiLog, beErr } from "../lib/backend";
+import { apiConn, apiModel, apiSettings, apiSql, apiLog, apiExport, beErr } from "../lib/backend";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "./ui";
 
@@ -420,6 +421,11 @@ export async function generateSql(tab: QueryTab, prompt: string): Promise<void> 
     toast("请先在右侧配置并启用一个模型", "err");
     return;
   }
+  // 多轮上下文：本轮之前的历史对话 + 上一轮生成的 SQL（首轮两者为空）
+  const history: ChatTurn[] = tab.messages.slice(-10).map((m) => ({ role: m.role, text: m.text }));
+  const prevSql = tab.sqls.length ? tab.sqls[tab.sqls.length - 1].sql : null;
+  const isFollowUp = history.length > 0 && !!prevSql;
+
   tab.messages.push({ role: "user", text: prompt, ts: now() });
   const runId = `gen:${tab.id}:${uid("r")}`;
   state.genRun[tab.id] = runId;
@@ -433,9 +439,10 @@ export async function generateSql(tab: QueryTab, prompt: string): Promise<void> 
       table: tab.table,
       prompt,
       mode: "new",
-      prevSql: null,
+      prevSql: isFollowUp ? prevSql : null,
       error: null,
       agent: state.settings.agentMode !== false,
+      history,
     });
     const dbMem = dbOf(tab.connId, tab.db);
     const relCount = dbMem?.relations.length ?? 0;
@@ -443,7 +450,8 @@ export async function generateSql(tab: QueryTab, prompt: string): Promise<void> 
     tab.messages.push({
       role: "ai",
       text:
-        `已结合本地记忆（${tab.db}：${dbMem?.tables.length ?? 0} 张表结构 / ${relCount} 组外键关系）与数据探查生成 SQL：` +
+        (isFollowUp ? "已结合历史对话与上一轮 SQL 迭代生成：" : "已生成 SQL：") +
+        `（本地记忆 ${tab.db}：${dbMem?.tables.length ?? 0} 张表结构 / ${relCount} 组外键关系）` +
         (explore?.summary ? `\n数据探查：${explore.summary.split("\n").slice(0, 4).join("；")}` : "") +
         (r.note ? `\n${r.note}` : ""),
       ts: now(),
@@ -507,6 +515,7 @@ export async function quickFixSql(tab: QueryTab, item: SqlItem): Promise<void> {
       error: item.error
         ? `[${item.error.code}] ${item.error.message}${item.error.hint ? `（提示：${item.error.hint}）` : ""}`
         : "",
+      history: tab.messages.slice(-10).map((m) => ({ role: m.role, text: m.text })),
     });
     tab.sqls.push({
       id: uid("sql"),
@@ -535,6 +544,27 @@ export async function quickFixSql(tab: QueryTab, item: SqlItem): Promise<void> {
 }
 
 /* ---------- SQL 执行 ---------- */
+
+/**
+ * 手写 / 粘贴 SQL：只是新增一条卡片，执行仍走 runSql
+ * （后端 AST 只读校验 + 超时自动取消 + 手动取消，与生成的 SQL 完全同一条链路）。
+ * 返回响应式代理对象，保证执行过程中卡片状态与计时器能刷新。
+ */
+export function addManualSql(tab: QueryTab, sql: string): SqlItem {
+  const item: SqlItem = {
+    id: uid("sql"),
+    sql,
+    status: "idle",
+    error: null,
+    ms: null,
+    rows: null,
+    ts: now(),
+    manual: true,
+  };
+  tab.sqls.push(item);
+  saveUi();
+  return tab.sqls[tab.sqls.length - 1];
+}
 
 export async function runSql(tab: QueryTab, item: SqlItem): Promise<void> {
   if (!tab.connId || !tab.db) {
@@ -612,4 +642,88 @@ export async function clearSqls(tab: QueryTab): Promise<void> {
   tab.sqls = [];
   tab.running = null;
   saveUi();
+}
+
+/* ---------- 结果导出 ---------- */
+
+/** 超过该行数时先让用户确认一次（后端结果集上限 5000 行，此处主要提示"结果可能已被截断"） */
+const EXPORT_CONFIRM_ROWS = 5000;
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** 文件名安全化：去掉 Windows / Excel 不友好的字符 */
+function safeName(s: string): string {
+  return (s || "result").replace(/[\\/:*?"<>|]/g, "_").slice(0, 40);
+}
+
+function stamp(): string {
+  const d = new Date();
+  const p = (n: number) => (n < 10 ? "0" + n : "" + n);
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/**
+ * 导出当前展示的结果集为 Excel（xlsx）或 JSON。
+ * 内容与界面一致：全部列（含类型）+ 全部结果行；路径由系统「另存为」对话框给出。
+ */
+export async function exportResult(tab: QueryTab, kind: "xlsx" | "json"): Promise<void> {
+  const r = tab.result;
+  if (!r || !r.rows.length) {
+    toast("当前没有可导出的结果，请先执行查询", "err");
+    return;
+  }
+  const ext = kind === "xlsx" ? "xlsx" : "json";
+  const def = `datamind-${safeName(tab.db || "result")}${tab.table ? "-" + safeName(tab.table) : ""}-${stamp()}.${ext}`;
+  let path: string | null = null;
+  try {
+    // 动态引入：浏览器（npm run dev）下没有 Tauri 环境时给出明确提示
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    path = await save({
+      defaultPath: def,
+      filters: [
+        {
+          name: kind === "xlsx" ? "Excel 工作簿" : "JSON 文件",
+          extensions: [ext],
+        },
+      ],
+    });
+  } catch {
+    toast("当前环境不支持保存对话框，请在桌面客户端中使用导出", "err");
+    return;
+  }
+  if (!path) return; // 用户取消
+
+  if (r.rows.length >= EXPORT_CONFIRM_ROWS) {
+    toast(`结果集 ${r.rows.length} 行${r.truncated ? "（已被截断）" : ""}，正在导出…`);
+  } else {
+    toast(`正在导出 ${r.rows.length} 行…`);
+  }
+
+  const src = [...tab.sqls].reverse().find((s) => s.status === "success");
+  try {
+    const stat = await apiExport.toFile({
+      path,
+      format: kind,
+      payload: {
+        columns: r.columns.map((c) => ({ name: c.name, type: c.type })),
+        rows: r.rows,
+        source: {
+          conn: connOf(tab.connId)?.name ?? "",
+          db: tab.db,
+          sql: src?.sql ?? "",
+        },
+      },
+    });
+    toast(
+      `已导出 ${stat.rows} 行 × ${stat.columns} 列 · ${fmtBytes(stat.bytes)}`,
+      "ok",
+    );
+  } catch (e) {
+    const err = beErr(e);
+    toast(`导出失败：${err.message}${err.hint ? `（${err.hint}）` : ""}`, "err");
+  }
 }

@@ -151,8 +151,16 @@ export interface SqlItem {
   ts: string;
   /** 是否为「快速修复」生成的卡片 */
   fixed?: boolean;
+  /** 是否为手写 / 粘贴创建的卡片 */
+  manual?: boolean;
   /** 生成过程（分析 / 探查 / 设计 / 生成 / 校验）留痕 */
   trace?: AgentStep[];
+}
+
+/** 多轮上下文：传给后端的一轮对话（越靠后越新） */
+export interface ChatTurn {
+  role: "user" | "ai";
+  text: string;
 }
 
 /** 对话消息 */

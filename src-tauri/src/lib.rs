@@ -4,6 +4,7 @@ mod agent;
 mod commands;
 mod diag;
 mod error;
+mod export;
 mod guard;
 mod llm;
 mod models;
@@ -25,6 +26,7 @@ pub static DATA_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLo
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 记录数据目录并安装 panic 钩子：release 采用 panic=abort，进程将直接终止，
             // 系统侧只有一条无堆栈的 WER 记录；钩子在终止前把 panic 现场写入 panic.log。
@@ -49,6 +51,7 @@ pub fn run() {
             commands::sql_execute,
             commands::sql_cancel,
             commands::sql_generate,
+            commands::result_export,
             commands::model_list,
             commands::model_save,
             commands::model_delete,

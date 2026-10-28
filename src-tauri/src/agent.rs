@@ -52,6 +52,27 @@ pub struct AgentCtx<'a> {
     pub table: &'a str,
     pub conn_id: &'a str,
     pub memory: Option<&'a ConnMemory>,
+    /// 多轮上下文：已渲染的历史对话（首轮为空）
+    pub history: &'a str,
+    /// 上一轮生成的 SQL（多轮迭代时的基线，首轮为空）
+    pub prev_sql: &'a str,
+}
+
+/// 前文（历史对话 + 上一轮 SQL）拼装：各阶段共享，保证整条流水线都在同一语境下推理
+fn context_block(history: &str, prev_sql: &str) -> String {
+    let mut s = String::new();
+    if !history.trim().is_empty() {
+        s.push_str(&format!("历史对话（理解语境用，以本轮需求为准）：\n{}\n\n", history.trim()));
+    }
+    if !prev_sql.trim().is_empty() {
+        s.push_str(&format!(
+            "上一轮生成的 SQL：\n{}\n\
+             （若本轮需求是对上一轮的补充/修正：在其基础上增量修改，保留仍正确的部分；\
+             若本轮明显换了一个问题：忽略它重新生成）\n\n",
+            prev_sql.trim()
+        ));
+    }
+    s
 }
 
 /// 通用规则：时间契约 / 只读 / 口径保护，各阶段共享
@@ -63,7 +84,10 @@ fn rules() -> String {
          3. 只能使用上下文里出现过的表和字段，不得臆造。\n\
          4. 时间列单位以「数据探查」结论为准：秒级时间戳用 FROM_UNIXTIME(col) 或 col 与 10 位时间戳比较，毫秒级先 /1000。\n\
          5. 一对多关系 JOIN 后再聚合会导致金额/计数翻倍，必要时先子查询去重再聚合。\n\
-         6. 注意软删除（is_deleted / deleted_at / del_flag）与状态字段，按需补过滤条件。",
+         6. 注意软删除（is_deleted / deleted_at / del_flag）与状态字段，按需补过滤条件。\n\
+         7. 若上下文给出「历史对话」与「上一轮 SQL」：本轮需求通常是对上一轮的补充/修正，\
+            应在上一轮 SQL 基础上增量修改（保留仍正确的部分），不要无视前文重新生成一个无关查询；\
+            但若本轮明显换了一个问题，则忽略上一轮 SQL 重新生成。",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
     )
 }
@@ -94,7 +118,9 @@ pub async fn run(
     ensure_alive(cancel)?;
     on_stage("schema", "分析表结构");
     let digest = schema_digest(ctx.memory, ctx.db, ctx.table, ctx.prompt);
-    let analysis = match stage_schema(model, &digest, ctx.prompt, ctx.table, cancel).await {
+    // 多轮语境：历史对话 + 上一轮 SQL，贯穿分析 / 设计 / 生成 / 校验
+    let context = context_block(ctx.history, ctx.prev_sql);
+    let analysis = match stage_schema(model, &digest, ctx.prompt, ctx.table, &context, cancel).await {
         Ok(a) => {
             let summary = a.summary();
             steps.push(step("schema", "结构分析", &summary, true));
@@ -122,7 +148,7 @@ pub async fn run(
     /* ---------- 3. SQL 设计 ---------- */
     ensure_alive(cancel)?;
     on_stage("design", "设计查询方案");
-    let design = match stage_design(model, &digest, &analysis, &findings, ctx.prompt, cancel).await {
+    let design = match stage_design(model, &digest, &analysis, &findings, ctx.prompt, &context, cancel).await {
         Ok(d) => {
             let s = d.clone();
             steps.push(step("design", "方案设计", &s, true));
@@ -145,7 +171,7 @@ pub async fn run(
     on_stage("build", "生成 SQL");
     let detail = schema_detail(ctx.memory, ctx.db, &analysis);
     let (mut sql, mut note) =
-        stage_build(model, &detail, &design, &findings, ctx.prompt, "", cancel).await?;
+        stage_build(model, &detail, &design, &findings, ctx.prompt, &context, "", cancel).await?;
     steps.push(step("build", "SQL 生成", &format!("{}\n{}", note, sql), true));
 
     /* ---------- 5. SQL 校验（最多修 1 轮） ---------- */
@@ -171,7 +197,7 @@ pub async fn run(
         ensure_alive(cancel)?;
         let fix_hint = format!("上一版 SQL 存在问题，请修正：\n- {}", issues.join("\n- "));
         // 重写一轮也允许被取消：取消是「立即退出」语义，不能降级成「继续下一阶段」
-        let rewritten = match stage_build(model, &detail, &design, &findings, ctx.prompt, &fix_hint, cancel).await {
+        let rewritten = match stage_build(model, &detail, &design, &findings, ctx.prompt, &context, &fix_hint, cancel).await {
             Ok(v) => Some(v),
             Err(e) if e.code == "CANCELLED" => return Err(e),
             Err(_) => None,
@@ -202,7 +228,7 @@ pub async fn run(
 
     // 模型复审：确认是否满足设计意图
     ensure_alive(cancel)?;
-    let review = stage_review(model, &detail, &design, &findings, &sql, ctx.prompt, cancel).await;
+    let review = stage_review(model, &detail, &design, &findings, &sql, ctx.prompt, &context, cancel).await;
     match review {
         Ok(r) => {
             steps.push(step(
@@ -307,6 +333,7 @@ async fn stage_schema(
     digest: &str,
     prompt: &str,
     table: &str,
+    context: &str,
     cancel: &CancellationToken,
 ) -> Result<Analysis, AppError> {
     let system = format!(
@@ -322,7 +349,7 @@ async fn stage_schema(
         rules()
     );
     let user = format!(
-        "用户问题：{}\n{}\n\n库表结构：\n{}",
+        "{context}用户问题：{}\n{}\n\n库表结构：\n{}",
         prompt,
         if table.is_empty() {
             String::new()
@@ -633,6 +660,7 @@ async fn stage_design(
     analysis: &Analysis,
     findings: &str,
     prompt: &str,
+    context: &str,
     cancel: &CancellationToken,
 ) -> Result<String, AppError> {
     let system = format!(
@@ -645,7 +673,7 @@ async fn stage_design(
         rules()
     );
     let user = format!(
-        "用户问题：{}\n\n结构分析：\n{}\n\n数据探查结论：\n{}\n\n库表结构（精简）：\n{}",
+        "{context}用户问题：{}\n\n结构分析：\n{}\n\n数据探查结论：\n{}\n\n库表结构（精简）：\n{}",
         prompt,
         analysis.summary(),
         findings,
@@ -697,6 +725,7 @@ async fn stage_build(
     design: &str,
     findings: &str,
     prompt: &str,
+    context: &str,
     fix_hint: &str,
     cancel: &CancellationToken,
 ) -> Result<(String, String), AppError> {
@@ -712,7 +741,7 @@ async fn stage_build(
         rules()
     );
     let user = format!(
-        "用户问题：{}\n\n查询方案：\n{}\n\n数据探查结论：\n{}\n\n表结构详情：\n{}{}",
+        "{context}用户问题：{}\n\n查询方案：\n{}\n\n数据探查结论：\n{}\n\n表结构详情：\n{}{}",
         prompt,
         design,
         findings,
@@ -745,6 +774,7 @@ async fn stage_review(
     findings: &str,
     sql: &str,
     prompt: &str,
+    context: &str,
     cancel: &CancellationToken,
 ) -> Result<Review, AppError> {
     let system = format!(
@@ -760,7 +790,7 @@ async fn stage_review(
         rules()
     );
     let user = format!(
-        "用户问题：{}\n\n查询方案：\n{}\n\n数据探查结论：\n{}\n\n表结构详情：\n{}\n\n待校验 SQL：\n{}",
+        "{context}用户问题：{}\n\n查询方案：\n{}\n\n数据探查结论：\n{}\n\n表结构详情：\n{}\n\n待校验 SQL：\n{}",
         prompt, design, findings, detail, sql
     );
     let content = crate::llm::chat(model, &system, &user, 0.0, cancel).await?;
@@ -1054,6 +1084,16 @@ mod tests {
         }
     }
 
+    /// 多轮上下文必须真正进入提示词：历史对话 + 上一轮 SQL
+    #[test]
+    fn context_block_carries_history_and_prev_sql() {
+        let s = context_block("用户：统计订单数\nDataMind：已生成 SQL", "SELECT COUNT(*) FROM orders");
+        assert!(s.contains("历史对话"), "缺少历史对话：{s}");
+        assert!(s.contains("统计订单数"), "历史内容丢失：{s}");
+        assert!(s.contains("SELECT COUNT(*) FROM orders"), "上一轮 SQL 丢失：{s}");
+        assert!(context_block("", "").is_empty(), "首轮不应产生上下文块");
+    }
+
     /// 取消后流水线必须立刻退出：不调用模型、不碰数据库，直接返回 CANCELLED
     #[tokio::test]
     async fn cancelled_pipeline_stops_immediately() {
@@ -1078,6 +1118,8 @@ mod tests {
             table: "orders",
             conn_id: "not-connected",
             memory: Some(&mem),
+            history: "",
+            prev_sql: "",
         };
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -1145,6 +1187,8 @@ mod tests {
             table: "orders",
             conn_id: "", // 无真实连接 → 探查阶段跳过
             memory: Some(&mem),
+            history: "",
+            prev_sql: "",
         };
         let cancel = CancellationToken::new();
         let ans = run(&model, &db, ctx, &|_k, _l| {}, &cancel).await.unwrap();

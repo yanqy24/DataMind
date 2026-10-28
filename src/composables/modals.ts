@@ -16,11 +16,14 @@ export const modelFormState = reactive({
 
 export const settingsState = reactive({ open: false });
 
-/** SQL 查看 / 编辑弹窗 */
+/** SQL 查看 / 编辑弹窗（edit = 改已有卡片，new = 手写/粘贴新建） */
 export const sqlEditorState = reactive({
   open: false,
+  mode: "edit" as "edit" | "new",
   tabId: "" as string,
   sqlId: "" as string,
+  /** 新建模式下的初始内容（例如从剪贴板/示例带入） */
+  initial: "" as string,
 });
 
 /** 本地记忆查看弹窗 */
@@ -47,8 +50,19 @@ export function openModelForm(editing: ModelConfig | null) {
   modelFormState.open = true;
 }
 export function openSqlEditor(tabId: string, sqlId: string) {
+  sqlEditorState.mode = "edit";
   sqlEditorState.tabId = tabId;
   sqlEditorState.sqlId = sqlId;
+  sqlEditorState.initial = "";
+  sqlEditorState.open = true;
+}
+
+/** 新建 SQL：手写或从别处粘贴一条 SELECT 后执行（仍走同一套只读校验与执行链路） */
+export function openNewSql(tabId: string, initial = "") {
+  sqlEditorState.mode = "new";
+  sqlEditorState.tabId = tabId;
+  sqlEditorState.sqlId = "";
+  sqlEditorState.initial = initial;
   sqlEditorState.open = true;
 }
 export function openMemory(connId: string, db = "") {

@@ -102,12 +102,19 @@ export function tableOf(
 
 /* ---------- UI 状态持久化（localStorage） ---------- */
 
+/** 结果集超过该行数时不写入本地持久化：结果集现已不截断，大结果会撑爆 localStorage 配额，
+ *  连带丢失窗口布局与 SQL 卡片（写入失败被 catch 吞掉，用户完全无感知）。 */
+const PERSIST_MAX_RESULT_ROWS = 2000;
+
 export function saveUi() {
   try {
+    const tabs = state.tabs.map((t) =>
+      t.result && t.result.rows.length > PERSIST_MAX_RESULT_ROWS ? { ...t, result: null } : t,
+    );
     const p: UiPersist = {
       collapsed: state.collapsed,
       sizes: state.sizes,
-      tabs: state.tabs,
+      tabs,
       activeTab: state.activeTab,
     };
     localStorage.setItem(UI_KEY, JSON.stringify(p));

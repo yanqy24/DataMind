@@ -113,10 +113,9 @@ export interface ModelConfig {
 /** SQL 执行结果集 */
 export interface QueryResult {
   columns: { name: string; type: string }[];
-  /** 行 -> 单元格值（已转字符串，NULL 为 null） */
+  /** 行 -> 单元格值（已转字符串，NULL 为 null）。完整结果集，不做行数截断 */
   rows: (string | null)[][];
   ms: number;
-  truncated: boolean;
 }
 
 /** SQL 卡片状态 */

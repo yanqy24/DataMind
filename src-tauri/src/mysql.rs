@@ -4,7 +4,8 @@
 //! - 执行前经 [crate::guard] 的 AST 校验，仅放行 SELECT
 //! - 单次执行受超时（默认 60s）与取消（run_id -> CancellationToken）双重控制；
 //!   超时 / 取消都会主动断开该连接并向服务端补发 KILL QUERY，避免语句在库上继续跑
-//! - 结果集超过 5000 行硬截断，配合 SQL 级 LIMIT 保护内存
+//! - SQL 原样下发：不改写用户语句（不追加 LIMIT），结果集完整返回；
+//!   大结果集由前端分页渲染，见 ResultGrid.vue
 //!
 //! 并发模型：连接池 / 隧道的增删由一把**短临界区**互斥锁保护，只在取连接的那一刻持锁；
 //! 查询与结构同步本身不持有任何全局锁，因此慢查询不会互相阻塞，也不会阻塞取消
@@ -32,8 +33,10 @@ const MAX_TABLES_PER_DB: usize = 2000;
 const SAMPLE_ROWS: usize = 2;
 /// 右键「查看建表语句」时实时取样的行数
 const SAMPLE_ROWS_LIVE: usize = 20;
-/// 结果集硬截断行数
-pub const MAX_RESULT_ROWS: usize = 5000;
+/*
+ * 历史说明：此前有过 `MAX_RESULT_ROWS = 5000` 的结果集硬截断，已按需求移除。
+ * 现在结果集完整返回前端，行数不再受限（渲染侧由分页控制每页 1000 行）。
+ */
 
 const SYSTEM_DATABASES: &[&str] = &["information_schema", "mysql", "performance_schema", "sys"];
 
@@ -480,7 +483,8 @@ impl DbManager {
         run_id: &str,
     ) -> Result<QueryResult, AppError> {
         guard::ensure_select_only(sql)?;
-        let sql_capped = guard::with_safe_limit(sql);
+        // 原样下发：不追加 LIMIT，结果集完整返回（改写用户 SQL 会改变其语义与执行计划）
+        let sql_capped = sql.to_string();
 
         // 令牌建在重试循环之外：用户取消对「重建连接后的第二次尝试」同样有效
         let token = self.begin_run(run_id);
@@ -1116,14 +1120,8 @@ fn type_label(c: &Column) -> &'static str {
     }
 }
 
+/// 行 -> 单元格矩阵。结果集完整保留，不做任何行数截断。
 fn convert_rows(rows: Vec<Row>, ms: u64) -> QueryResult {
-    let mut truncated = false;
-    let mut rows = rows;
-    if rows.len() > MAX_RESULT_ROWS {
-        rows.truncate(MAX_RESULT_ROWS);
-        truncated = true;
-    }
-
     let mut columns = Vec::new();
     let mut data: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len());
     if let Some(first) = rows.first() {
@@ -1161,7 +1159,6 @@ fn convert_rows(rows: Vec<Row>, ms: u64) -> QueryResult {
         columns,
         rows: data,
         ms,
-        truncated,
     }
 }
 

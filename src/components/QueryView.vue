@@ -474,7 +474,6 @@ function persistSizes() {
             <template v-else-if="tab.result">
               <span class="tag tag--ok">完成</span>
               <span>共 <b>{{ tab.result.rows.length }}</b> 条
-                <template v-if="tab.result.truncated">（已截断）</template>
                 <template v-if="lastOk?.ms != null"> · {{ lastOk.ms }} ms</template>
               </span>
             </template>

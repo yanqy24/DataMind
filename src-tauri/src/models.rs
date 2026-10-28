@@ -179,10 +179,9 @@ pub struct SqlLogItem {
 #[serde(rename_all = "camelCase")]
 pub struct QueryResult {
     pub columns: Vec<QueryColumn>,
-    /// 行 -> 单元格（NULL 为 null）
+    /// 行 -> 单元格（NULL 为 null）。完整结果集，不做行数截断。
     pub rows: Vec<Vec<Option<String>>>,
     pub ms: u64,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

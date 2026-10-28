@@ -11,9 +11,9 @@ use std::path::Path;
 
 use crate::error::AppError;
 
-/* ---------- 规模上限（防御性保护，正常结果集上限为 5000 行） ---------- */
-/// 单次导出最大行数：超出直接报错，避免写出几百 MB 的文件把界面拖死
-const MAX_EXPORT_ROWS: usize = 50_000;
+/* ---------- 规模保护 ---------- */
+/// 结果集不再有行数上限，导出也**不设行数上限**：导出内容与界面展示一致，写多少行由结果集决定。
+/// （历史：曾限制 50_000 行，与「不再限制结果集」冲突，已移除）
 /// 单个单元格写入 Excel 前的最大长度（Excel 单元格上限 32767）
 const MAX_CELL_CHARS: usize = 30_000;
 
@@ -80,16 +80,6 @@ pub fn export_to(path: &str, format: &str, payload: &ExportPayload) -> Result<Ex
     if payload.rows.is_empty() {
         return Err(AppError::new("EXPORT_EMPTY", "当前结果集没有数据行，无法导出"));
     }
-    if payload.rows.len() > MAX_EXPORT_ROWS {
-        return Err(
-            AppError::new("EXPORT_TOO_LARGE", format!(
-                "结果集 {} 行，超过单次导出上限 {} 行",
-                fmt_usize(payload.rows.len()), MAX_EXPORT_ROWS
-            ))
-            .with_hint("请在 SQL 中缩小范围（加时间条件或聚合）后再导出"),
-        );
-    }
-
     // 扩展名校验：避免把 xlsx 内容写进 .json 之类的错位文件
     let lower = path.to_ascii_lowercase();
     let ext_ok = if kind == "xlsx" { lower.ends_with(".xlsx") } else { lower.ends_with(".json") };
@@ -367,18 +357,6 @@ fn numeric(s: &str) -> Option<f64> {
         return None;
     }
     t.parse::<f64>().ok()
-}
-
-fn fmt_usize(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            out.insert(0, ',');
-        }
-        out.insert(0, ch);
-    }
-    out
 }
 
 #[cfg(test)]

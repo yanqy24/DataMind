@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/* 数据展示栏表格：多选 / 列宽拖拽 / 右键复制（文本 & Markdown） */
+/* 数据展示栏表格：多选 / 列宽拖拽 / 右键复制（文本 & Markdown） / 大结果集分页 */
 import { computed, reactive, ref, watch } from "vue";
 import type { QueryResult } from "../types";
 import { copyText, openCtxMenu, icon } from "../composables/ui";
@@ -14,15 +14,55 @@ let dragging = false;
 const widths = reactive<Record<number, number>>({});
 const tableEl = ref<HTMLTableElement | null>(null);
 
-const key = (r: number, c: number) => `${r}:${c}`;
+/* ---------- 分页（结果集超过单页行数时出现，单页上限 1000 行） ---------- */
+/** 可选单页行数，最大 1000 */
+const PAGE_SIZES = [100, 200, 500, 1000] as const;
+const pageSize = ref<number>(1000);
+const page = ref(1);
+
+const total = computed(() => props.result?.rows.length ?? 0);
+const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)));
+const start = computed(() => (page.value - 1) * pageSize.value);
+/** 结果集超过一页时才展示分页条 */
+const showPager = computed(() => total.value > pageSize.value);
+/** 当前页行：`gi` 为全局行号（跨页连续，行号与选中态都以它为准） */
+const pageRows = computed(() => {
+  const res = props.result;
+  if (!res) return [] as { gi: number; row: (string | null)[] }[];
+  const s = start.value;
+  const out: { gi: number; row: (string | null)[] }[] = [];
+  const end = Math.min(s + pageSize.value, res.rows.length);
+  for (let i = s; i < end; i++) out.push({ gi: i, row: res.rows[i] });
+  return out;
+});
+const pageFrom = computed(() => (total.value === 0 ? 0 : start.value + 1));
+const pageTo = computed(() => Math.min(start.value + pageSize.value, total.value));
+
+function go(p: number) {
+  page.value = Math.min(Math.max(1, Math.trunc(p) || 1), pageCount.value);
+}
+function setPageSize(n: number) {
+  const first = start.value; // 保持当前页首行大致可见
+  pageSize.value = n;
+  page.value = Math.min(Math.max(1, Math.floor(first / n) + 1), Math.max(1, Math.ceil(total.value / n)));
+}
+/** 千分位，便于阅读大结果集行数 */
+const fmt = (n: number): string => n.toLocaleString("en-US");
 
 watch(
   () => props.result,
   () => {
     clearSel();
+    page.value = 1;
     for (const k of Object.keys(widths)) delete (widths as Record<string, number>)[k];
   },
 );
+// 结果集变化（行数变少）时把页码夹回合法范围
+watch(pageCount, (n) => {
+  if (page.value > n) page.value = n;
+});
+
+const key = (r: number, c: number) => `${r}:${c}`;
 
 function clearSel() {
   for (const k of Object.keys(sel)) delete sel[k];
@@ -140,13 +180,15 @@ function onCtx(e: MouseEvent, r: number, c: number) {
       },
     },
     {
-      label: "全选结果",
+      label: showPager.value ? "全选本页" : "全选结果",
       icon: "check",
       onClick: () => {
         const res = props.result;
         if (!res) return;
         clearSel();
-        res.rows.forEach((_, r) => res.columns.forEach((_, c) => (sel[key(r, c)] = true)));
+        pageRows.value.forEach(({ gi }) =>
+          res.columns.forEach((_, c) => (sel[key(gi, c)] = true)),
+        );
       },
     },
     { label: "取消选中", icon: "x", onClick: clearSel },
@@ -191,57 +233,80 @@ const isNum = (v: string | null): boolean =>
 </script>
 
 <template>
-  <div class="grid-wrap" @keydown="onKeyCopy">
-    <div v-if="!result || !result.rows.length" class="result-empty">
-      {{ result ? "查询无结果" : "执行 SQL 后在此展示结果集" }}
+  <div class="grid-pane">
+    <div class="grid-wrap" @keydown="onKeyCopy">
+      <div v-if="!result || !result.rows.length" class="result-empty">
+        {{ result ? "查询无结果" : "执行 SQL 后在此展示结果集" }}
+      </div>
+      <table
+        v-else
+        ref="tableEl"
+        class="dgrid"
+        :class="{ 'is-fixed': anyFixed() }"
+        @mouseup="onMouseUp"
+        @contextmenu="onCtx($event, 0, 0)"
+      >
+        <thead>
+          <tr>
+            <th class="rownum">#</th>
+            <th v-for="(c, ci) in result.columns" :key="ci" :style="widths[ci] ? `width:${widths[ci]}px` : ''">
+              <div class="th-in">
+                <span class="th-name" :title="c.name">{{ c.name }}</span>
+                <span v-if="c.type" class="th-type">{{ c.type }}</span>
+                <span
+                  class="th-resize"
+                  title="拖动调整列宽，双击自适应"
+                  @mousedown="startResize($event, ci)"
+                  @dblclick.stop="autoFit(ci)"
+                ></span>
+              </div>
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in pageRows" :key="item.gi">
+            <td class="rownum">{{ item.gi + 1 }}</td>
+            <td
+              v-for="(c, ci) in result.columns"
+              :key="ci"
+              :class="{
+                num: isNum(item.row[ci]),
+                null: item.row[ci] === null || item.row[ci] === '',
+                'is-sel': !!sel[`${item.gi}:${ci}`],
+              }"
+              :data-r="item.gi"
+              :data-c="ci"
+              :title="item.row[ci] === null ? 'NULL' : String(item.row[ci] ?? '')"
+              @mousedown="onCellDown($event, item.gi, ci)"
+              @mousemove="onCellMove($event, item.gi, ci)"
+              @click="onCellClick($event, item.gi, ci)"
+            >
+              {{ item.row[ci] === null || item.row[ci] === undefined || item.row[ci] === "" ? "NULL" : item.row[ci] }}
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
-    <table
-      v-else
-      ref="tableEl"
-      class="dgrid"
-      :class="{ 'is-fixed': anyFixed() }"
-      @mouseup="onMouseUp"
-      @contextmenu="onCtx($event, 0, 0)"
-    >
-      <thead>
-        <tr>
-          <th class="rownum">#</th>
-          <th v-for="(c, ci) in result.columns" :key="ci" :style="widths[ci] ? `width:${widths[ci]}px` : ''">
-            <div class="th-in">
-              <span class="th-name" :title="c.name">{{ c.name }}</span>
-              <span v-if="c.type" class="th-type">{{ c.type }}</span>
-              <span
-                class="th-resize"
-                title="拖动调整列宽，双击自适应"
-                @mousedown="startResize($event, ci)"
-                @dblclick.stop="autoFit(ci)"
-              ></span>
-            </div>
-          </th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="(row, ri) in result.rows" :key="ri">
-          <td class="rownum">{{ ri + 1 }}</td>
-          <td
-            v-for="(c, ci) in result.columns"
-            :key="ci"
-            :class="{
-              num: isNum(row[ci]),
-              null: row[ci] === null || row[ci] === '',
-              'is-sel': !!sel[`${ri}:${ci}`],
-            }"
-            :data-r="ri"
-            :data-c="ci"
-            :title="row[ci] === null ? 'NULL' : String(row[ci] ?? '')"
-            @mousedown="onCellDown($event, ri, ci)"
-            @mousemove="onCellMove($event, ri, ci)"
-            @click="onCellClick($event, ri, ci)"
-          >
-            {{ row[ci] === null || row[ci] === undefined || row[ci] === "" ? "NULL" : row[ci] }}
-          </td>
-        </tr>
-      </tbody>
-    </table>
+
+    <!-- 分页：结果集超过单页行数时出现（数据展示栏右下角） -->
+    <div v-if="showPager" class="grid-pager">
+      <span class="grid-pager__info">
+        第 {{ fmt(pageFrom) }}-{{ fmt(pageTo) }} 条 / 共 {{ fmt(total) }} 条
+      </span>
+      <select class="grid-pager__size" :value="pageSize" title="每页行数（最大 1000）"
+        @change="setPageSize(Number(($event.target as HTMLSelectElement).value))">
+        <option v-for="n in PAGE_SIZES" :key="n" :value="n">{{ n }} 条/页</option>
+      </select>
+      <button class="pbtn pbtn--edge" :disabled="page <= 1" title="首页" @click="go(1)">«</button>
+      <button class="pbtn" :disabled="page <= 1" title="上一页" @click="go(page - 1)" v-html="icon('left', 12)"></button>
+      <span class="grid-pager__page">
+        <input class="grid-pager__input" type="number" min="1" :max="pageCount" :value="page"
+          @keydown.enter.prevent="go(Number(($event.target as HTMLInputElement).value))"
+          @blur="go(Number(($event.target as HTMLInputElement).value))" />
+        / {{ fmt(pageCount) }}
+      </span>
+      <button class="pbtn" :disabled="page >= pageCount" title="下一页" @click="go(page + 1)" v-html="icon('right', 12)"></button>
+      <button class="pbtn pbtn--edge" :disabled="page >= pageCount" title="末页" @click="go(pageCount)">»</button>
+    </div>
   </div>
 </template>

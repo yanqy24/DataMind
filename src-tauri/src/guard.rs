@@ -1,4 +1,4 @@
-//! guard.rs — 只读保护：AST 级校验仅放行 SELECT 查询，并为大结果集追加安全上限
+//! guard.rs — 只读保护：AST 级校验仅放行 SELECT 查询
 //!
 //! 安全模型：前端预检 + 后端 AST 双重校验，任何写操作（INSERT/UPDATE/DELETE/DDL/存储过程等）
 //! 都会在执行前被拦截，保证工具对数据库绝对只读。
@@ -71,23 +71,30 @@ fn check_set_expr(e: &SetExpr) -> Result<(), AppError> {
     }
 }
 
-/// 为无 LIMIT 的纯 SELECT 追加行数上限，防止误查全表拖垮内存
-/// （结果集在 [crate::mysql] 中另有一层 5000 行硬截断，此处是 SQL 级保护）
-pub const SAFE_LIMIT: u64 = 5001;
+/*
+ * 历史说明：此处曾为无 LIMIT 的 SELECT 自动追加 `LIMIT 5001`，并在结果侧做 5000 行硬截断。
+ * 该行为已按需求移除 —— SQL 原样下发、结果集完整返回，大结果集由前端分页按需渲染
+ * （见 ResultGrid.vue）。若将来需要保护，应在**设置项**中显式开启，而不是默认改写用户 SQL。
+ */
 
-pub fn with_safe_limit(sql: &str) -> String {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    // WITH 开头的语句在子查询语义下拼接 LIMIT 兼容性差，交由行级截断保护
-    if trimmed.to_ascii_lowercase().starts_with("with") {
-        return trimmed.to_string();
+#[cfg(test)]
+mod tests {
+    use super::ensure_select_only;
+
+    /// 不限制结果集：校验只判断「是否只读」，既不改写语句也不要求必须带 LIMIT
+    #[test]
+    fn select_without_limit_is_allowed() {
+        assert!(ensure_select_only("SELECT * FROM orders").is_ok());
+        assert!(ensure_select_only("SELECT * FROM orders LIMIT 10").is_ok());
+        assert!(ensure_select_only("WITH x AS (SELECT 1) SELECT * FROM x").is_ok());
     }
-    let lower = trimmed.to_ascii_lowercase();
-    // 已含顶层 LIMIT / 锁定子句则不重复处理
-    if lower.contains(" limit ") || lower.ends_with(" limit")
-        || lower.contains(" for update")
-        || lower.contains(" lock in share mode")
-    {
-        return trimmed.to_string();
+
+    /// 移除 LIMIT 逻辑不能以放松只读约束为代价
+    #[test]
+    fn write_and_lock_are_still_rejected() {
+        assert!(ensure_select_only("DELETE FROM orders").is_err());
+        assert!(ensure_select_only("UPDATE orders SET a = 1").is_err());
+        assert!(ensure_select_only("SELECT * FROM orders FOR UPDATE").is_err());
+        assert!(ensure_select_only("SELECT * FROM orders INTO OUTFILE '/tmp/a'").is_err());
     }
-    format!("{trimmed} LIMIT {SAFE_LIMIT}")
 }

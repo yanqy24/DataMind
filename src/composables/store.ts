@@ -594,10 +594,7 @@ export async function runSql(tab: QueryTab, item: SqlItem): Promise<void> {
     item.ms = result.ms;
     item.rows = result.rows.length;
     tab.result = result as QueryResult;
-    toast(
-      `查询完成 · ${result.rows.length} 条${result.truncated ? "（结果已截断）" : ""}`,
-      "ok",
-    );
+    toast(`查询完成 · ${result.rows.length} 条`, "ok");
   } catch (e) {
     const err = beErr(e);
     const ms = Date.now() - start;
@@ -646,7 +643,7 @@ export async function clearSqls(tab: QueryTab): Promise<void> {
 
 /* ---------- 结果导出 ---------- */
 
-/** 超过该行数时先让用户确认一次（后端结果集上限 5000 行，此处主要提示"结果可能已被截断"） */
+/** 超过该行数时导出提示里额外给出行数（大结果集写盘需要一点时间） */
 const EXPORT_CONFIRM_ROWS = 5000;
 
 function fmtBytes(n: number): string {
@@ -698,7 +695,7 @@ export async function exportResult(tab: QueryTab, kind: "xlsx" | "json"): Promis
   if (!path) return; // 用户取消
 
   if (r.rows.length >= EXPORT_CONFIRM_ROWS) {
-    toast(`结果集 ${r.rows.length} 行${r.truncated ? "（已被截断）" : ""}，正在导出…`);
+    toast(`结果集 ${r.rows.length} 行，正在导出（行数较多，请稍候）…`);
   } else {
     toast(`正在导出 ${r.rows.length} 行…`);
   }

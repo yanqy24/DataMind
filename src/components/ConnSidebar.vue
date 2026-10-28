@@ -112,11 +112,11 @@ function tableMenu(connId: string, d: DatabaseMeta, t: TableMeta, x: number, y: 
   openCtxMenu(x, y, [
     { header: true, label: `${d.name}.${t.name}` },
     { label: "新建该表查询窗口", icon: "terminal", onClick: () => newQuery(connId, d.name, t.name) },
-    { label: "预览前 100 条数据", icon: "play", onClick: () => void previewTable(connId, d.name, t.name) },
+    { label: "查询该表数据", icon: "play", onClick: () => void previewTable(connId, d.name, t.name) },
     { label: "查看建表语句 / 取样", icon: "edit", onClick: () => openTable(connId, d.name, t) },
     "sep",
     { label: "复制表名", icon: "copy", onClick: () => copyText(t.name) },
-    { label: "复制 SELECT 模板", icon: "copy", onClick: () => copyText(`SELECT * FROM \`${t.name}\` LIMIT 100;`) },
+    { label: "复制 SELECT 模板", icon: "copy", onClick: () => copyText(`SELECT * FROM \`${t.name}\`;`) },
   ]);
 }
 
@@ -207,7 +207,7 @@ function rowsBadge(n: number): string {
                   @click="selected = tc.connId + '/' + d.name + '/' + t.name"
                   @dblclick="void previewTable(tc.connId, d.name, t.name)"
                   @contextmenu.prevent="tableMenu(tc.connId, d, t, $event.clientX, $event.clientY)"
-                  title="双击：新建该表查询窗口并预览前 100 条"
+                  title="双击：新建该表查询窗口并查询整表数据"
                 >
                   <span class="tnode__caret"></span>
                   <span class="tnode__icon" v-html="icon('table', 13)"></span>

@@ -102,7 +102,7 @@ const followUp = computed(() => tab.value.messages.length > 0 && tab.value.sqls.
 function newSql() {
   // 已选中数据表时预填一条可直接改的骨架，未选表则留空让用户自由粘贴
   const t = tab.value.table.replace(/`/g, "");
-  openNewSql(tab.value.id, t ? `SELECT * FROM \`${t}\` LIMIT 100` : "");
+  openNewSql(tab.value.id, t ? `SELECT * FROM \`${t}\`` : "");
 }
 
 /* ---------- 结果导出 ---------- */
@@ -486,10 +486,12 @@ function persistSizes() {
             <template v-else-if="tab.result">
               <button class="btn btn--sm" @click="copyAll"><span v-html="icon('copy', 12)"></span> 复制全部</button>
               <button class="btn btn--sm" @click="copyMd"><span v-html="icon('copy', 12)"></span> 复制为 Markdown</button>
-              <button class="btn btn--sm" :disabled="!!exporting" @click="doExport('xlsx')">
+              <button class="btn btn--sm" :disabled="!!exporting" @click="doExport('xlsx')"
+                title="导出全部结果行（不受分页影响）">
                 <span v-html="icon('down', 12)"></span> {{ exporting === "xlsx" ? "导出中…" : "导出 Excel" }}
               </button>
-              <button class="btn btn--sm" :disabled="!!exporting" @click="doExport('json')">
+              <button class="btn btn--sm" :disabled="!!exporting" @click="doExport('json')"
+                title="导出全部结果行（不受分页影响）">
                 <span v-html="icon('down', 12)"></span> {{ exporting === "json" ? "导出中…" : "导出 JSON" }}
               </button>
             </template>

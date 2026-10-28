@@ -77,7 +77,7 @@ function saveAndRun() {
         <label>{{ isNew ? "手写或粘贴一条 SELECT 语句" : "SQL 语句（支持修改后直接运行）" }}</label>
         <textarea v-model="text" class="textarea mono" style="min-height:220px" spellcheck="false"
           :placeholder="isNew
-            ? 'SELECT * FROM orders WHERE ctime >= UNIX_TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL 7 DAY)) LIMIT 100'
+            ? 'SELECT * FROM orders WHERE ctime >= UNIX_TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL 7 DAY))'
             : ''"
           @keydown.enter.ctrl.prevent="saveAndRun" @keydown.enter.meta.prevent="saveAndRun"></textarea>
       </div>

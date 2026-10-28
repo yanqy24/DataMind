@@ -358,7 +358,7 @@ export function createTab(opts: { connId?: string; db?: string; table?: string; 
   return state.tabs[state.tabs.length - 1];
 }
 
-/** 双击数据表：新建该表的查询窗口，并立即在结果栏展示前 100 条数据 */
+/** 双击数据表：新建该表的查询窗口并立即查询整表（结果集不截断，由界面分页展示） */
 export async function previewTable(connId: string, db: string, table: string): Promise<void> {
   if (!connId || !db || !table) return;
   const conn = connOf(connId);
@@ -370,7 +370,8 @@ export async function previewTable(connId: string, db: string, table: string): P
   });
   const item: SqlItem = {
     id: uid("sql"),
-    sql: `SELECT * FROM \`${table.replace(/`/g, "")}\` LIMIT 100`,
+    // 不追加 LIMIT：结果集完整返回，界面按单页 1000 行分页展示
+    sql: `SELECT * FROM \`${table.replace(/`/g, "")}\``,
     status: "idle",
     error: null,
     ms: null,
@@ -701,8 +702,9 @@ export async function exportResult(tab: QueryTab, kind: "xlsx" | "json"): Promis
   }
   if (!path) return; // 用户取消
 
+  // 导出始终作用于完整结果集，与界面分页无关（分页只影响渲染）
   if (r.rows.length >= EXPORT_CONFIRM_ROWS) {
-    toast(`结果集 ${r.rows.length} 行，正在导出（行数较多，请稍候）…`);
+    toast(`正在导出全部 ${r.rows.length} 行（不受分页影响，行数较多请稍候）…`);
   } else {
     toast(`正在导出 ${r.rows.length} 行…`);
   }

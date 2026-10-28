@@ -141,6 +141,15 @@ npm run tauri:dev     # 开发模式（前端热更新）
 npm run tauri:build   # 打包发布版 exe + NSIS 安装包
 ```
 
+**一键打包并运行**：项目根目录的 `build-and-run.bat`，双击即可依次完成「拉取最新代码 → 打包 → 启动应用」。
+（文件为 GBK + CRLF 编码，请勿转成 UTF-8，否则 cmd 解析会错位。）
+
+```bat
+build-and-run.bat              :: 拉取最新代码 + 打包 + 启动应用
+build-and-run.bat --skip-pull  :: 跳过 git pull，用本地代码打包
+build-and-run.bat --installer  :: 打包后运行 NSIS 安装程序（而非直接启动 exe）
+```
+
 构建产物：
 
 ```

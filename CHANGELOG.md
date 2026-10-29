@@ -32,6 +32,7 @@
 
 - 版本号升至 **v1.1.0**（`package.json` / `src-tauri/Cargo.toml` / `tauri.conf.json` / 界面角标同步）。
 - 后端新增依赖：`rust_xlsxwriter`（Excel 写入）、`tauri-plugin-dialog`（另存为对话框）。
+- **数据展示栏表格**：单元格内容全部改为**左右居中**（含数值列与行号列），并补齐**竖向列分隔线**，与原有行线共同构成完整网格；末列不画右边界，由滚动容器收口。
 
 ### 修复
 

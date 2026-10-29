@@ -343,12 +343,13 @@
   position: sticky; top: 0; z-index: 2;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
-  padding: 0; text-align: left;
+  border-right: 1px solid var(--grid-line);
+  padding: 0; text-align: center;
   font-weight: 500; color: var(--text-2);
   white-space: nowrap; user-select: none;
 }
 .dgrid th .th-in{
-  display: flex; align-items: center; gap: 5px;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
   padding: 0 10px; position: relative; height: 32px;
 }
 .dgrid th .th-name { overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
@@ -361,17 +362,22 @@
 .dgrid td{
   height: var(--row-h); padding: 0 10px;
   border-bottom: 1px solid var(--grid-line);
+  border-right: 1px solid var(--grid-line);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   max-width: 420px; cursor: default; color: var(--text);
+  text-align: center;
 }
+/* 末列不画右边界：整张表由容器的滚动边缘收口 */
+.dgrid tr > *:last-child { border-right: 0; }
 .dgrid tbody tr:hover td { background: var(--surface-2); }
 .dgrid td.is-sel{ background: var(--sel); box-shadow: inset 0 0 0 1px var(--accent-line); }
-.dgrid td.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+/* 数值列同样居中（仅保留等宽字体与数字对齐） */
+.dgrid td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .dgrid td.null { color: var(--text-3); font-style: italic; }
 .dgrid .rownum{
-  width: 46px; min-width: 46px; text-align: right; color: var(--text-3);
+  width: 46px; min-width: 46px; text-align: center; color: var(--text-3);
   background: var(--surface); position: sticky; left: 0; z-index: 1;
-  font-family: var(--mono); font-size: 11px; padding-right: 12px;
+  font-family: var(--mono); font-size: 11px; padding: 0 6px;
 }
 .dgrid th.rownum { z-index: 3; }
 .dgrid tbody tr:hover td.rownum { background: var(--surface-2); }

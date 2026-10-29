@@ -2,10 +2,9 @@
 
 # DataMind
 
-**与数据对话** — 自然语言查询数据库的桌面客户端
+**与数据对话** — 自然语言查询数据库的桌面客户端（MySQL AI客户端）
 
 用一句话描述你要的数据，DataMind 结合数据库结构记忆生成 SQL 并直接执行。  
-基于 Tauri 2 构建，单文件约 10 MB，数据不出本机。
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 

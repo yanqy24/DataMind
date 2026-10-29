@@ -197,6 +197,8 @@ export interface QueryTab {
   messages: ChatMessage[];
   sqls: SqlItem[];
   result: QueryResult | null;
+  /** 产生当前 result 的 SQL 卡片 id（导出/翻页按它重查，而不是"最新成功的卡片"） */
+  resultSourceId?: string | null;
   /** 结果集的服务端分页状态（仅在当前结果是分页查询时有值） */
   paging?: ResultPaging | null;
   running: string | null;

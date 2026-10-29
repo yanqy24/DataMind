@@ -624,6 +624,9 @@ export async function runSql(
     // 分页时卡片显示总行数（本页行数在结果栏展示），未分页时两者相同
     item.rows = result.total ?? result.rows.length;
     tab.result = result as QueryResult;
+    // 记录"当前结果来自哪条 SQL"：导出与翻页都以它为准（重跑其它 SQL 失败/取消时 result 不变，
+    // 此时不能按"最新成功的卡片"取 SQL，否则导出内容与展示结果对不上）
+    tab.resultSourceId = item.id;
     // 用户自带 LIMIT 时后端不分页（total 为实际行数、pageSize 为 0），界面也不分页
     const paged = (result.pageSize ?? 0) > 0;
     tab.paging = paged
@@ -653,14 +656,23 @@ export async function runSql(
 }
 
 /**
- * 翻页 / 改单页行数：用同一条 SQL 重新执行「目标页」的查询（服务端分页）。
+ * 翻页 / 改单页行数：用产生当前结果的那条 SQL 重新执行「目标页」的查询（服务端分页）。
  * 结果栏会短暂进入「查询中」状态（复用 runSql 的超时与取消机制）。
  */
 export async function gotoResultPage(tab: QueryTab, page: number, pageSize?: number): Promise<void> {
-  const item = [...tab.sqls].reverse().find((s) => s.status === "success");
+  const item = resultSourceOf(tab);
   if (!item) return;
   const size = pageSize ?? tab.paging?.pageSize ?? DEFAULT_PAGE_SIZE;
   await runSql(tab, item, { page, pageSize: size, silent: page > 1 || size !== tab.paging?.pageSize });
+}
+
+/** 产生当前展示结果的 SQL 卡片：优先按 resultSourceId 精确取，取不到再回退「最新成功」 */
+function resultSourceOf(tab: QueryTab): SqlItem | null {
+  if (tab.resultSourceId) {
+    const byId = tab.sqls.find((s) => s.id === tab.resultSourceId);
+    if (byId) return byId;
+  }
+  return [...tab.sqls].reverse().find((s) => s.status === "success") ?? null;
 }
 
 /** 窗口当前查询的 run_id（翻页时 run_id 带页码后缀，取消必须用它才能命中） */
@@ -675,12 +687,17 @@ export async function cancelSql(tab: QueryTab, item: SqlItem): Promise<void> {
   }
 }
 
-/** 删除单条 SQL 卡片（若正在运行则先取消） */
+/** 删除单条 SQL 卡片（若正在运行则先取消；删掉当前结果的来源时同步清空结果栏） */
 export async function deleteSql(tab: QueryTab, item: SqlItem): Promise<void> {
   if (item.status === "running") await cancelSql(tab, item);
   const i = tab.sqls.findIndex((s) => s.id === item.id);
   if (i >= 0) tab.sqls.splice(i, 1);
   if (tab.running === item.id) tab.running = null;
+  if (tab.resultSourceId === item.id) {
+    tab.resultSourceId = null;
+    tab.result = null;
+    tab.paging = null;
+  }
   saveUi();
 }
 
@@ -690,6 +707,10 @@ export async function clearSqls(tab: QueryTab): Promise<void> {
   if (runningItem) await cancelSql(tab, runningItem);
   tab.sqls = [];
   tab.running = null;
+  // 卡片全清后结果栏不再有来源 SQL，导出/翻页无法重查 → 一并清空
+  tab.resultSourceId = null;
+  tab.result = null;
+  tab.paging = null;
   saveUi();
 }
 
@@ -743,8 +764,9 @@ export async function exportResult(tab: QueryTab, kind: "xlsx" | "json"): Promis
   }
   if (!path) return; // 用户取消
 
-  // 结果集为服务端分页时，把原始 SQL 交给后端**重新查全量**再导出（导出不受分页限制）
-  const src = [...tab.sqls].reverse().find((s) => s.status === "success");
+  // 结果集为服务端分页时，把**产生当前结果的原始 SQL**（不是列表里最新成功的卡片）
+  // 交给后端**重新查全量**再导出（导出不受分页限制）
+  const src = resultSourceOf(tab);
   const paged = !!tab.paging && !!src && !!tab.connId;
   const query = paged
     ? { connId: tab.connId as string, db: tab.db, sql: src!.sql, timeoutSecs: state.settings.sqlTimeout }

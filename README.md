@@ -150,11 +150,11 @@ build-and-run.bat --skip-pull  :: 跳过 git pull，用本地代码打包
 build-and-run.bat --installer  :: 打包后运行 NSIS 安装程序（而非直接启动 exe）
 ```
 
-构建产物：
+构建产物（两个都可分发，Release 里都会提供）：
 
 ```
-src-tauri/target/release/DataMind.exe          # 单文件可直接运行
-src-tauri/target/release/bundle/nsis/*.exe     # NSIS 安装包
+src-tauri/target/release/datamind.exe           # 单文件版：双击即用（发布时命名为 DataMind_<版本>_x64-portable.exe）
+src-tauri/target/release/bundle/nsis/*.exe      # NSIS 安装包：DataMind_<版本>_x64-setup.exe
 ```
 
 > **注意**：发行构建必须启用 `custom-protocol` feature（前端资源才会随 exe 内嵌）。  
